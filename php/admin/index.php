@@ -21,7 +21,6 @@ $posts = $pdo->query("SELECT * FROM posts ORDER BY created_time DESC LIMIT 100")
             <th>Risk</th>
             <th>Label</th>
             <th>Action</th>
-            <th></th>
         </tr>
         <?php foreach ($posts as $p): ?>
             <tr>
