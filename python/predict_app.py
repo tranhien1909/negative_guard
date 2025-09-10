@@ -159,6 +159,7 @@ async def home():
                         </li>
                     </ul>
                 </nav>
+                 <a href="register.php" class="btn">Login / Register</a>
                 <button class="nav-toggle-btn" aria-label="Toggle menu" data-nav-toggler>
                     <ion-icon name="menu-sharp" aria-hidden="true" class="menu-icon"></ion-icon>
                     <ion-icon name="close-sharp" aria-hidden="true" class="close-icon"></ion-icon>
