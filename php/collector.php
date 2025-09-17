@@ -1,31 +1,34 @@
 <?php
-// php/collector.php
+// file collectior.php
 declare(strict_types=1);
 
-require __DIR__ . '/config.php';
+$config = require __DIR__ . '/config.php';
 require __DIR__ . '/db.php';
 
 date_default_timezone_set($config['app']['timezone'] ?? 'Asia/Bangkok');
 
-$pdo   = db_connect($config['db']);
-$fbCfg = $config['facebook'];
+// tách auth và options cho rõ
+$auth = $config['fb'];           // page_id, page_access_token, graph_version
+$opts = $config['facebook'] ?? []; // fetch_window_hours, limit, fetch_comments,...
 
-if (empty($fbCfg['page_id']) || empty($fbCfg['page_access_token'])) {
-    fail("Missing facebook.page_id or facebook.page_access_token in config.php");
+if (empty($auth['page_id']) || empty($auth['page_access_token'])) {
+    fail("Missing fb.page_id or fb.page_access_token in config.php");
 }
 
-$base = 'https://graph.facebook.com/v21.0';
-$limit = (int)($fbCfg['limit'] ?? 25);
-$since = compute_since($pdo, (int)($fbCfg['fetch_window_hours'] ?? 24));
+$version = $auth['graph_version'] ?? 'v23.0';
+$base = "https://graph.facebook.com/$version";
+
+$limit = (int)($opts['limit'] ?? 25);
+$since = compute_since($pdo, (int)($opts['fetch_window_hours'] ?? 24));
 
 $params = [
-    'access_token' => $fbCfg['page_access_token'],
+    'access_token' => $auth['page_access_token'],
     'fields'       => 'id,from,message,created_time,permalink_url',
     'limit'        => $limit,
     'since'        => $since,
 ];
 
-$url = $base . '/' . rawurlencode($fbCfg['page_id']) . '/posts?' . http_build_query($params);
+$url = $base . '/' . rawurlencode($auth['page_id']) . '/posts?' . http_build_query($params);
 
 $total = 0;
 while ($url) {
@@ -37,8 +40,8 @@ while ($url) {
         $total++;
 
         // (tùy chọn) kéo comment cho mỗi post
-        if (!empty($fbCfg['fetch_comments'])) {
-            collect_comments($pdo, $p['id'], $fbCfg);
+        if (!empty($opts['fetch_comments'])) {
+            collect_comments($pdo, $p['id'], $base, $auth['page_access_token'], $opts);
         }
     }
     $url = $data['paging']['next'] ?? null;
@@ -51,41 +54,44 @@ exit(0);
 
 function compute_since(PDO $pdo, int $hours): int
 {
-    $max = $pdo->query("SELECT MAX(created_at) FROM posts WHERE platform='facebook'")->fetchColumn();
+    $max = $pdo->query("SELECT MAX(created_time) FROM posts")->fetchColumn();
     if ($max) return max(0, strtotime($max) - 3600); // backoff 1h
     return time() - $hours * 3600;
 }
 
 function store_post(PDO $pdo, array $p): void
 {
-    $id   = $p['id'] ?? '';
-    if (!$id) return;
-    $author = $p['from']['name'] ?? null;
-    $msg    = $p['message'] ?? '';
+    $fbId    = $p['id'] ?? '';
+    if (!$fbId) return;
+    $fromId  = $p['from']['id'] ?? null;
+    $message = $p['message'] ?? '';
     $created = !empty($p['created_time']) ? date('Y-m-d H:i:s', strtotime($p['created_time'])) : null;
-    $link   = $p['permalink_url'] ?? null;
+    $link    = $p['permalink_url'] ?? null;
 
-    $sql = "INSERT INTO posts(platform, external_id, author_name, content, url, created_at, fetched_at, status, kind)
-          VALUES ('facebook', :id, :author, :content, :url, :created_at, :fetched_at, 'normal', 'post')
-          ON DUPLICATE KEY UPDATE author_name=VALUES(author_name), content=VALUES(content),
-                                  url=VALUES(url), created_at=VALUES(created_at), fetched_at=VALUES(fetched_at)";
+    $sql = "INSERT INTO posts (fb_post_id, message, created_time, permalink_url, from_id, last_seen)
+            VALUES (:fbid, :message, :created_time, :plink, :from_id, NOW())
+            ON DUPLICATE KEY UPDATE
+              message = VALUES(message),
+              created_time = COALESCE(posts.created_time, VALUES(created_time)),
+              permalink_url = VALUES(permalink_url),
+              from_id = VALUES(from_id),
+              last_seen = NOW()";
     $st = $pdo->prepare($sql);
     $st->execute([
-        ':id' => $id,
-        ':author' => $author,
-        ':content' => $msg,
-        ':url' => $link,
-        ':created_at' => $created,
-        ':fetched_at' => date('Y-m-d H:i:s'),
+        ':fbid' => $fbId,
+        ':message' => $message,
+        ':created_time' => $created,
+        ':plink' => $link,
+        ':from_id' => $fromId,
     ]);
 }
 
-function collect_comments(PDO $pdo, string $postId, array $fbCfg): void
+
+function collect_comments(PDO $pdo, string $postId, string $base, string $pageToken, array $opts): void
 {
-    $base = 'https://graph.facebook.com/v21.0';
     $params = [
-        'access_token' => $fbCfg['page_access_token'],
-        'limit' => (int)($fbCfg['comments_limit'] ?? 50),
+        'access_token' => $pageToken,
+        'limit' => (int)($opts['comments_limit'] ?? 50),
         'filter' => 'stream',
         'fields' => 'id,from,message,created_time,permalink_url',
     ];
@@ -108,28 +114,37 @@ function collect_comments(PDO $pdo, string $postId, array $fbCfg): void
 
 function store_comment(PDO $pdo, string $postId, array $c): void
 {
-    $id   = $c['id'] ?? '';
+    $id      = $c['id'] ?? '';
     if (!$id) return;
-    $author = $c['from']['name'] ?? null;
-    $msg    = $c['message'] ?? '';
+    $fromId  = $c['from']['id']   ?? null;
+    $message = $c['message']      ?? '';
     $created = !empty($c['created_time']) ? date('Y-m-d H:i:s', strtotime($c['created_time'])) : null;
-    $link   = $c['permalink_url'] ?? null; // có thể null từ v20+
+    $link    = $c['permalink_url'] ?? null;
 
-    $sql = "INSERT INTO posts(platform, external_id, parent_external_id, author_name, content, url, created_at, fetched_at, status, kind)
-          VALUES ('facebook', :id, :parent, :author, :content, :url, :created_at, :fetched_at, 'normal', 'comment')
-          ON DUPLICATE KEY UPDATE author_name=VALUES(author_name), content=VALUES(content),
-                                  url=VALUES(url), created_at=VALUES(created_at), fetched_at=VALUES(fetched_at)";
+    $meta = json_encode([
+        'permalink_url' => $link,
+        'kind' => 'comment',
+        'parent_id' => $postId
+    ], JSON_UNESCAPED_UNICODE);
+
+    $sql = "INSERT INTO posts (id, message, created_time, from_id, meta)
+            VALUES (:id, :message, :created_time, :from_id, :meta)
+            ON DUPLICATE KEY UPDATE
+              message = VALUES(message),
+              created_time = VALUES(created_time),
+              from_id = VALUES(from_id),
+              meta = VALUES(meta),
+              updated_at = CURRENT_TIMESTAMP";
     $st = $pdo->prepare($sql);
     $st->execute([
         ':id' => $id,
-        ':parent' => $postId,
-        ':author' => $author,
-        ':content' => $msg,
-        ':url' => $link,
-        ':created_at' => $created,
-        ':fetched_at' => date('Y-m-d H:i:s'),
+        ':message' => $message,
+        ':created_time' => $created,
+        ':from_id' => $fromId,
+        ':meta' => $meta,
     ]);
 }
+
 
 function http_json(string $url): array
 {

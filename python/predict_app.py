@@ -1,28 +1,74 @@
-from fastapi import FastAPI
+from typing import Optional, Dict
+import os, math, joblib
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import joblib, os
+from pydantic import BaseModel
 
-app = FastAPI()
+app = FastAPI(title="iCheck - Information Connection", version="1.2.0")
 
-# Mount thư mục assets để load CSS/JS/Images
-app.mount("/assets", StaticFiles(directory="../assets"), name="assets")
+# ========= Config =========
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))  # p_max tối thiểu
+MARGIN_THRESHOLD     = float(os.getenv("MARGIN_THRESHOLD", "0.20"))      # p_max - p_second tối thiểu
+W_NEG, W_UNC_MARGIN, W_UNC_ENTROPY = 0.75, 0.15, 0.10                    # trọng số risk
 
-# Cho phép gọi từ trình duyệt
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",") if o.strip()]
+API_KEY = os.getenv("PREDICT_API_KEY", "").strip()
+
+# ========= Helpers =========
+def _entropy(probs):
+    """Entropy chuẩn hoá về [0,1]."""
+    k = len(probs)
+    if k <= 1: return 0.0
+    s = 0.0
+    for p in probs:
+        p = max(min(float(p), 1-1e-12), 1e-12)
+        s -= p * math.log(p)
+    return s / math.log(k)
+
+def _classes_from(pipe):
+    """Lấy classes_ từ bước cuối của Pipeline/CalibratedClassifierCV."""
+    try:
+        last_name, last_est = list(pipe.named_steps.items())[-1]
+        return list(last_est.classes_)
+    except Exception:
+        return list(getattr(pipe, "classes_", []))
+
+# ========= Static / CORS =========
+ASSETS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets"))
+if os.path.isdir(ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,   # đổi "*" -> nguồn tin cậy khi lên prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load model
-MODEL_FILE = "artifacts/model_pipeline.pkl"
-if not os.path.exists(MODEL_FILE):
-    raise RuntimeError(f"Model file not found: {MODEL_FILE}. Run train_model.py first.")
-model = joblib.load(MODEL_FILE)
+# ========= Model I/O =========
+class PredictIn(BaseModel):
+    text: str
+
+class PredictOut(BaseModel):
+    label: str
+    proba: Dict[str, float]
+    risk_score: float
+    confidence: Optional[float] = None  # p_max
+    margin: Optional[float] = None      # p_max - p_second
+    entropy: Optional[float] = None     # [0..1]
+    low_confidence: Optional[bool] = None
+
+ARTIFACT_PATH = os.getenv(
+    "MODEL_ARTIFACT",
+    os.path.join(os.path.dirname(__file__), "artifacts", "model_pipeline.pkl")
+)
+if not os.path.exists(ARTIFACT_PATH):
+    raise RuntimeError(f"Model file not found: {ARTIFACT_PATH}. Run train_model_calibrated.py first.")
+PIPE = joblib.load(ARTIFACT_PATH)
+
 
 
 # Trang giao diện iCheck
@@ -159,7 +205,8 @@ async def home():
                         </li>
                     </ul>
                 </nav>
-                 <a href="register.php" class="btn">Login / Register</a>
+                <a href="http://localhost/negative-info-guard/php/admin/login.php" class="btn">Login / Register</a>
+
                 <button class="nav-toggle-btn" aria-label="Toggle menu" data-nav-toggler>
                     <ion-icon name="menu-sharp" aria-hidden="true" class="menu-icon"></ion-icon>
                     <ion-icon name="close-sharp" aria-hidden="true" class="close-icon"></ion-icon>
@@ -181,11 +228,6 @@ async def home():
                         <p class="hero-text">
 
                         </p>
-                        <form action="" class="hero-form" method="POST">
-                            <input type="email" name="email_address" aria-label="email"
-                                placeholder="Your Email Address..." required class="email-field">
-                            <button type="submit" class="btn">Get Response Back</button>
-                        </form>
                     </div>
                     <figure class="hero-banner">
                         <img src="/assets/images/iuh.jpg" width="587" height="839" alt="hero banner" class="w-100">
@@ -401,62 +443,110 @@ async def home():
 
 
         <script>
-        async function analyze() {
-            let text = document.getElementById("inputText").value;
-            if (!text.trim()) {
-                document.getElementById("result").innerHTML = "<div class='result medium'>⚠️ Vui lòng nhập nội dung!</div>";
-                return;
+async function analyze(){
+  const elOut = document.getElementById("result");
+  const text = (document.getElementById("inputText").value || "").trim();
+  if(!text){ elOut.innerHTML = "<div class='result medium'>⚠️ Vui lòng nhập nội dung!</div>"; return; }
+
+  try{
+    const res = await fetch("/predict", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ text })
+    });
+    const data = await res.json(); // <-- BẮT BUỘC: lấy data từ res
+
+    const risk = data.risk_score ?? 0;
+    const label = data.label ?? "-";
+    const confidence = data.confidence ?? Math.max(...Object.values(data.proba || { [label]: 1 }));
+    const margin = data.margin ?? 0;
+    const entropy = data.entropy ?? 0;
+    const lowConf = data.low_confidence ?? (confidence < 0.6 || margin < 0.2);
+
+    let cssClass = "safe", status = "🟢 An toàn";
+    if (risk < 0.4) { cssClass = "safe"; status = "🟢 An toàn"; }
+    else if (risk < 0.7) { cssClass = "medium"; status = lowConf ? "🟠 Nghi ngờ (cần duyệt)" : "🟡 Trung bình"; }
+    else { cssClass = "danger"; status = "🔴 Nguy hiểm"; }
+
+    elOut.innerHTML = `
+      <div class="result ${cssClass}">
+        <p><b>📝 Kết quả phân tích:</b></p>
+        <ul style="margin:0;padding-left:18px;">
+          <li><b>Label:</b> ${label}</li>
+          <li><b>Độ rủi ro:</b> ${(risk*100).toFixed(1)}%</li>
+          <li><b>Độ tin cậy (p_max):</b> ${(confidence*100).toFixed(1)}%</li>
+          <li><b>Biên (margin):</b> ${(margin*100).toFixed(1)}%</li>
+          <li><b>Độ mơ hồ (entropy):</b> ${(entropy*100).toFixed(1)}%</li>
+          <li><b>Mức cảnh báo:</b> ${status}</li>
+          <li><b>Khuyến nghị:</b>
+            ${
+              lowConf
+                ? "🟠 Mô hình chưa chắc chắn — vui lòng người duyệt xem lại."
+                : (risk < 0.4
+                    ? "✅ Nội dung an toàn, có thể đăng."
+                    : risk < 0.7
+                      ? "⚠️ Cần xem xét trước khi đăng."
+                      : "🚨 Nội dung tiêu cực, cần gỡ/kiểm duyệt gấp!")
             }
+          </li>
+          <li><b>Thời gian phân tích:</b> ${new Date().toLocaleString()}</li>
+        </ul>
+      </div>`;
+  }catch(e){
+    elOut.innerHTML = "<div class='result danger'>❌ Lỗi kết nối tới API!</div>";
+  }
+}
+</script>
+</body></html>
+"""
 
-            try {
-                let res = await fetch("/predict", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({text: text})
-                });
-                let data = await res.json();
-                let risk = data.risk_score;
-                let label = data.label;
-                let cssClass = "safe", status = "🟢 An toàn";
+# ========= API =========
+@app.get("/healthz")
+def healthz():
+    return {"status":"ok"}
 
-                if (risk < 0.4) { cssClass = "safe"; status = "🟢 An toàn"; }
-                else if (risk < 0.7) { cssClass = "medium"; status = "🟡 Trung bình"; }
-                else { cssClass = "danger"; status = "🔴 Nguy hiểm"; }
+@app.post("/predict", response_model=PredictOut)
+def predict(inp: PredictIn, x_api_key: Optional[str] = Header(default=None)):
+    # Nếu đặt API_KEY thì yêu cầu header
+    if API_KEY and (not x_api_key or x_api_key != API_KEY):
+        raise HTTPException(401, "Invalid or missing API key.")
 
-                let now = new Date().toLocaleString();
+    text = (inp.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Text is required.")
 
-                document.getElementById("result").innerHTML = `
-                    <div class="result ${cssClass}">
-                        <p><b>📝 Kết quả phân tích:</b></p>
-                        <ul style="margin:0;padding-left:18px;">
-                            <li><b>Label:</b> ${label}</li>
-                            <li><b>Độ rủi ro:</b> ${(risk*100).toFixed(1)}%</li>
-                            <li><b>Mức cảnh báo:</b> ${status}</li>
-                            <li><b>Khuyến nghị:</b> 
-                                ${risk < 0.4 
-                                    ? "✅ Nội dung an toàn, có thể đăng tải." 
-                                    : risk < 0.7 
-                                        ? "⚠️ Cần xem xét trước khi đăng." 
-                                        : "🚨 Nội dung tiêu cực, cần gỡ bỏ hoặc kiểm duyệt gấp!"}
-                            </li>
-                            <li><b>Thời gian phân tích:</b> ${now}</li>
-                        </ul>
-                    </div>
-                `;
-            } catch (err) {
-                document.getElementById("result").innerHTML = "<div class='result danger'>❌ Lỗi kết nối tới API!</div>";
-            }
-        }
-        </script>
-    </body>
-    </html>
-    """
+    label = PIPE.predict([text])[0]
 
+    # Phân bố xác suất
+    proba: Dict[str, float] = {}
+    probs, classes = [], []
+    if hasattr(PIPE, "predict_proba"):
+        probs = PIPE.predict_proba([text])[0].tolist()
+        classes = _classes_from(PIPE) or ["negative","neutral","positive"][:len(probs)]
+        proba = {classes[i]: float(probs[i]) for i in range(len(probs))}
+    else:
+        proba, probs = {label: 1.0}, [1.0]
 
-# API JSON (cho hệ thống khác gọi)
-@app.post("/predict")
-async def predict(payload: dict):
-    text = payload.get("text", "")
-    pred = model.predict([text])[0]
-    prob = max(model.predict_proba([text])[0])
-    return {"label": pred, "risk_score": float(prob)}
+    # Các đại lượng từ phân bố
+    p_neg = float(proba.get("negative", 0.0))
+    p_sorted = sorted(probs, reverse=True)
+    p_max = float(p_sorted[0])
+    p_second = float(p_sorted[1]) if len(p_sorted) > 1 else 0.0
+    margin = p_max - p_second
+    ent = _entropy(probs)
+
+    # Risk tổng hợp (dựa trên xác suất đã calibrate nếu bạn train bằng CalibratedClassifierCV)
+    risk = W_NEG*p_neg + W_UNC_MARGIN*(1 - margin) + W_UNC_ENTROPY*ent
+    risk = max(0.0, min(1.0, risk))
+
+    low_conf = (p_max < CONFIDENCE_THRESHOLD) or (margin < MARGIN_THRESHOLD)
+
+    return PredictOut(
+        label=label,
+        proba=proba,
+        risk_score=risk,
+        confidence=p_max,
+        margin=margin,
+        entropy=ent,
+        low_confidence=low_conf,
+    )

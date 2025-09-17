@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Negative Info Guard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 10px;
+            font-size: 14px;
+        }
+
+        button {
+            margin-top: 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #result {
+            margin-top: 20px;
+            font-size: 16px;
+            padding: 10px;
+            border: 1px solid #ccc;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>🔍 Kiểm tra mức độ cảnh báo</h2>
+    <textarea id="inputText" rows="6" placeholder="Nhập bài viết..."></textarea><br>
+    <button onclick="analyze()">Phân tích</button>
+    <div id="result"></div>
+
+    <script>
+        async function analyze() {
+            let text = document.getElementById("inputText").value;
+            if (!text.trim()) {
+                document.getElementById("result").innerHTML = "⚠️ Vui lòng nhập nội dung!";
+                return;
+            }
+
+            try {
+                let res = await fetch("http://127.0.0.1:8000/predict", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text: text })
+                });
+                let data = await res.json();
+                document.getElementById("result").innerHTML = `
+          <b>Label:</b> ${data.label} <br>
+          <b>Risk Score:</b> ${data.risk_score}
+        `;
+            } catch (error) {
+                document.getElementById("result").innerHTML = "❌ Lỗi kết nối tới API!";
+            }
+        }
+    </script>
+</body>
+
+</html>
