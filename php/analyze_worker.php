@@ -4,7 +4,8 @@ declare(strict_types=1);
 $config = require __DIR__ . '/config.php';
 require __DIR__ . '/db.php';
 
-$predictUrl = $config['ml']['predict_url'] ?? 'http://127.0.0.1:8000/predict';
+$predictUrl = $config['ml']['predict_url'] ?? getenv('ML_PREDICT_URL') ?? 'http://127.0.0.1:8000/predict';
+fwrite(STDERR, "ML URL (forced): {$predictUrl}\n");
 if (!$predictUrl) {
     fwrite(STDERR, "ERROR: predict_url is empty\n");
     exit(1);
