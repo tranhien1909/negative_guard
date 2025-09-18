@@ -1,9 +1,9 @@
+<!-- file admin\login.php -->
 <?php
 
-declare(strict_types=1);
 session_start();
 
-$config = require __DIR__ . '/../config.php';
+$config = require dirname(__DIR__) . '/config.php';
 $user = $config['auth']['username'] ?? 'admin';
 $passHash = $config['auth']['password_hash'] ?? null;   // ưu tiên hash
 $passPlain = $config['auth']['password'] ?? null;       // fallback (dev)

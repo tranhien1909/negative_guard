@@ -5,49 +5,63 @@ CREATE DATABASE IF NOT EXISTS negative_guard
 USE negative_guard;
 
 -- Bảng posts: Row ID nội bộ + FB Post ID riêng
-CREATE TABLE posts (
-  id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,         -- Row ID nội bộ (PRIMARY)
-  fb_post_id        VARCHAR(64)  NOT NULL,                           -- Facebook Post ID: pageid_postid
-  message           TEXT NULL,
-  created_time      DATETIME NULL,                                   -- thời điểm post trên FB
-  permalink_url     VARCHAR(255) NULL,
-  from_id           VARCHAR(64)  NULL,                               -- người đăng (page/user id)
-  risk_score        DECIMAL(5,4) NOT NULL DEFAULT 0.0000,            -- 0..1
-  label             VARCHAR(32)  NOT NULL DEFAULT '',                -- negative/neutral/positive
-  action_taken      VARCHAR(32)  NOT NULL DEFAULT 'none',            -- none/pending/commented/posted
-  last_analysis_time DATETIME NULL,
-  last_seen         DATETIME NULL,                                   -- lần cuối collector thấy post
-  meta              JSON NULL,                                       -- dữ liệu phụ (kind, parent_id, ...)
-  created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  UNIQUE KEY uq_fb_post_id (fb_post_id),
-  KEY idx_created_time      (created_time),
-  KEY idx_last_seen         (last_seen),
-  KEY idx_risk_score        (risk_score),
-  KEY idx_action_taken      (action_taken),
-  KEY idx_label             (label),
-  KEY idx_from_id           (from_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS posts (
+  fb_post_id       VARCHAR(64) PRIMARY KEY,
+  from_id          VARCHAR(64) NULL,
+  message          MEDIUMTEXT NULL,
+  permalink_url    TEXT NULL,
+  created_time     DATETIME NULL,
+  last_seen        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  risk_score       FLOAT DEFAULT NULL,
+  label            VARCHAR(32) DEFAULT NULL,
+  action_taken     VARCHAR(32) NOT NULL DEFAULT 'none',
+  INDEX idx_created (created_time),
+  INDEX idx_last_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Bảng logs cho manual/auto actions, kèm http_code & error để debug Graph API
-CREATE TABLE audit_logs (
-  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  post_id     VARCHAR(64) NULL,          -- có thể là fb_post_id hoặc row id tuỳ bạn log
-  action_type VARCHAR(50) NOT NULL,      -- manual_comment/manual_post/auto_comment/...
-  reason      TEXT NULL,
-  payload     JSON NULL,                 -- raw response từ Graph
-  http_code   SMALLINT NULL,             -- HTTP status của Graph
-  error       TEXT NULL,                 -- cURL error hoặc message
-  actor       VARCHAR(100) NULL,         -- admin/bot
-  created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (id),
-  KEY idx_post_id (post_id),
-  KEY idx_created_at (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- comments: duy nhất theo fb_comment_id, biết post cha
+CREATE TABLE IF NOT EXISTS comments (
+  fb_comment_id    VARCHAR(64) PRIMARY KEY,
+  parent_fb_post_id VARCHAR(64) NOT NULL,
+  from_id          VARCHAR(64) NULL,
+  message          MEDIUMTEXT NULL,
+  permalink_url    TEXT NULL,
+  created_time     DATETIME NULL,
+  last_seen        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_parent (parent_fb_post_id),
+  INDEX idx_cmt_created (created_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Khoá dành cho cron
-CREATE TABLE cron_lock (
-  name         VARCHAR(50) PRIMARY KEY,
-  locked_until DATETIME
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- thêm cột cho bảng posts (nếu chưa có)
+ALTER TABLE posts
+  ADD COLUMN last_analysis_time DATETIME NULL AFTER last_seen;
+
+-- bảng audit_logs (worker đang INSERT vào bảng này)
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  post_id VARCHAR(64) NOT NULL,
+  action_type VARCHAR(32) NOT NULL,
+  reason VARCHAR(255) NULL,
+  payload TEXT NULL,
+  actor VARCHAR(64) NOT NULL DEFAULT 'admin',
+  http_code INT NULL,
+  error VARCHAR(255) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_post (post_id),
+  INDEX idx_act (action_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+ALTER TABLE comments
+  ADD COLUMN risk_score FLOAT NULL,
+  ADD COLUMN label VARCHAR(32) NULL,
+  ADD COLUMN last_analysis_time DATETIME NULL;
+
+  -- cho bài viết
+UPDATE posts
+SET last_analysis_time = NULL
+WHERE risk_score IS NULL OR label IS NULL;
+
+-- cho bình luận
+UPDATE comments
+SET last_analysis_time = NULL
+WHERE risk_score IS NULL OR label IS NULL;

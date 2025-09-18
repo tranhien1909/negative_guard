@@ -25,3 +25,17 @@
 [2025-09-16T13:46:50+07:00] Fetched 6 posts
 [2025-09-16T13:52:05+07:00] Fetched 1 posts
 [2025-09-16T14:20:05+07:00] Fetched 1 posts
+[2025-09-17T21:43:11+07:00] FATAL: HTTP 400: {"error":{"message":"Error validating access token: Session has expired on Wednesday, 17-Sep-25 03:00:00 PDT. The current time is Wednesday, 17-Sep-25 07:42:34 PDT.","type":"OAuthException","code":190,"error_subcode":463,"fbtrace_id":"A8BAD9iLf9xyL8-oCLo8M8t"}}
+[2025-09-17T21:45:18+07:00] FATAL: HTTP 400: {"error":{"message":"Error validating access token: Session has expired on Wednesday, 17-Sep-25 03:00:00 PDT. The current time is Wednesday, 17-Sep-25 07:44:41 PDT.","type":"OAuthException","code":190,"error_subcode":463,"fbtrace_id":"AsWFwjStBEX-Ohnlbs3j8sQ"}}
+[2025-09-17T21:45:59+07:00] FATAL: HTTP 400: {"error":{"message":"Error validating access token: Session has expired on Wednesday, 17-Sep-25 03:00:00 PDT. The current time is Wednesday, 17-Sep-25 07:45:22 PDT.","type":"OAuthException","code":190,"error_subcode":463,"fbtrace_id":"ArSoGllKijVIPStRed09nWL"}}
+[2025-09-17T21:49:18+07:00] Post 786334934561714_122104305771000718: stored 4 comments
+[2025-09-17T21:49:21+07:00] Post 786334934561714_122104299039000718: stored 1 comments
+[2025-09-17T21:49:22+07:00] Post 786334934561714_122104150851000718: stored 2 comments
+[2025-09-17T21:49:22+07:00] Fetched 7 posts
+[2025-09-18T02:25:20+07:00] Post 786334934561714_122105694579000718: stored 1 comments
+[2025-09-18T02:25:20+07:00] Fetched 2 posts
+[2025-09-18T02:34:45+07:00] Fetched 2 posts
+[2025-09-18T02:35:11+07:00] Fetched 2 posts
+[2025-09-18T03:34:16+07:00] Fetched 2 posts
+[2025-09-18T03:47:02+07:00] Fetched 2 posts
+[2025-09-18T10:10:03+07:00] Fetched 2 posts

@@ -1,0 +1,17 @@
+[2025-09-17T21:54:23+07:00] predict error for 786334934561714_122104150851000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2039 ms: Couldn't connect to server
+[2025-09-17T21:54:25+07:00] predict error for 786334934561714_122104298529000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2030 ms: Couldn't connect to server
+[2025-09-17T21:54:27+07:00] predict error for 786334934561714_122104299039000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2028 ms: Couldn't connect to server
+[2025-09-17T21:54:29+07:00] predict error for 786334934561714_122104304925000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2016 ms: Couldn't connect to server
+[2025-09-17T21:54:31+07:00] predict error for 786334934561714_122104305645000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2024 ms: Couldn't connect to server
+[2025-09-17T21:54:33+07:00] predict error for 786334934561714_122104305771000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2025 ms: Couldn't connect to server
+[2025-09-17T21:54:35+07:00] predict error for 786334934561714_122105694579000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2025 ms: Couldn't connect to server
+[2025-09-18T02:25:27+07:00] predict error for 786334934561714_122106064587000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2048 ms: Couldn't connect to server
+[2025-09-18T02:35:17+07:00] predict error for 786334934561714_122106065709000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2023 ms: Couldn't connect to server
+[2025-09-18T03:34:23+07:00] predict error for 786334934561714_122104305771000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2037 ms: Couldn't connect to server
+[2025-09-18T03:34:25+07:00] predict error for 786334934561714_122104305645000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2030 ms: Couldn't connect to server
+[2025-09-18T03:34:27+07:00] predict error for 786334934561714_122104304925000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2045 ms: Couldn't connect to server
+[2025-09-18T03:34:29+07:00] predict error for 786334934561714_122104299039000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2035 ms: Couldn't connect to server
+[2025-09-18T03:34:31+07:00] predict error for 786334934561714_122104298529000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2049 ms: Couldn't connect to server
+[2025-09-18T03:34:33+07:00] predict error for 786334934561714_122104150851000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2031 ms: Couldn't connect to server
+[2025-09-18T03:34:35+07:00] predict error for 786334934561714_122105694579000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2048 ms: Couldn't connect to server
+[2025-09-18T03:34:37+07:00] predict error for 786334934561714_122106064587000718: HTTP 0 Failed to connect to 127.0.0.1 port 8000 after 2047 ms: Couldn't connect to server

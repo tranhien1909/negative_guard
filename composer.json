@@ -1,0 +1,9 @@
+{
+  "name": "negative-info-guard/app",
+  "description": "Negative Info Guard PHP app",
+  "type": "project",
+  "require": {
+    "php": ">=8.0",
+    "vlucas/phpdotenv": "^5.6"
+  }
+}

@@ -6,47 +6,236 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="iCheck - Information Connection", version="1.2.0")
+# predict_app.py
+import os, json, math, unicodedata
+from joblib import load
+import re
 
-# ========= Config =========
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))  # p_max tối thiểu
-MARGIN_THRESHOLD     = float(os.getenv("MARGIN_THRESHOLD", "0.20"))      # p_max - p_second tối thiểu
-W_NEG, W_UNC_MARGIN, W_UNC_ENTROPY = 0.75, 0.15, 0.10                    # trọng số risk
+app = FastAPI()
+MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/model_pipeline.pkl")
+THRESHOLD  = float(os.getenv("RISK_THRESHOLD", "0.6"))  # 0.6 khắt khe hơn
 
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",") if o.strip()]
-API_KEY = os.getenv("PREDICT_API_KEY", "").strip()
-
-# ========= Helpers =========
-def _entropy(probs):
-    """Entropy chuẩn hoá về [0,1]."""
-    k = len(probs)
-    if k <= 1: return 0.0
-    s = 0.0
-    for p in probs:
-        p = max(min(float(p), 1-1e-12), 1e-12)
-        s -= p * math.log(p)
-    return s / math.log(k)
-
-def _classes_from(pipe):
-    """Lấy classes_ từ bước cuối của Pipeline/CalibratedClassifierCV."""
+pipe = None
+if os.path.exists(MODEL_PATH):
     try:
-        last_name, last_est = list(pipe.named_steps.items())[-1]
-        return list(last_est.classes_)
+        pipe = load(MODEL_PATH)
     except Exception:
-        return list(getattr(pipe, "classes_", []))
+        pipe = None
 
-# ========= Static / CORS =========
-ASSETS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets"))
-if os.path.isdir(ASSETS_DIR):
-    app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+class Inp(BaseModel):
+    text: str
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # đổi "*" -> nguồn tin cậy khi lên prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def strip_accents(s: str) -> str:
+    # bỏ dấu tiếng Việt, chuẩn hóa
+    s = s.replace("đ", "d").replace("Đ", "D")
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join([c for c in nfkd if not unicodedata.combining(c)])
+
+def vi_norm(s: str) -> str:
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # bỏ dấu
+    s = s.lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalize(s: str) -> str:
+    s = strip_accents(s.lower())
+    # rút gọn ký tự lặp: vclllll -> vcl
+    out = []
+    last = ""
+    for ch in s:
+        if not ch.isalnum() and ch not in " _":
+            ch = " "
+        if ch == last and ch.isalpha():
+            continue
+        last = ch
+        out.append(ch)
+    return " ".join("".join(out).split())
+
+# Từ/cụm tục & xúc phạm phổ biến (không phân biệt dấu)
+PROFANITY = [
+    "dm", "dmm", "dkm", "dcm", "deo", "deo*", "deo*", "deo", "cmm",
+    "dit", "ditme", "dit*me", "vcl", "vkl", "vl", "cl",
+    "lon", "lolon", "cac", "buoi", "bu*oi", "loz", "loz*",
+    "cc", "ccmm", "ngu", "oc cho", "occho", "cho chet", "khon nan", "khonnan", "shit"
+]
+# Ngữ cảnh giáo dục
+EDU_CTX = ["truong", "lop", "giao vien", "giaovien", "hoc sinh", "hocsinh", "sinh vien", "sinhvien"]
+
+def lexicon_score(text: str):
+    t = normalize(text)
+    hits = []
+    score = 0.0
+
+    def has(token: str) -> bool:
+        return f" {token} " in f" {t} "
+
+    # profanity mạnh
+    strong = ["dkm", "dcm", "ditme", "loz", "lon", "buoi", "vch"]
+    if any(has(w) for w in strong):
+        score = max(score, 0.90)
+        hits += [w for w in strong if has(w)]
+
+    # profanity vừa
+    medium = ["dm", "dmm", "deo", "vcl", "vkl", "cl", "ccmm", "cc"]
+    if any(has(w) for w in medium):
+        score = max(score, 0.80)
+        hits += [w for w in medium if has(w)]
+
+    # miệt thị/thoá mạ nhẹ
+    light = ["ngu", "oc cho", "occho", "khon nan", "khonnan"]
+    if any(has(w) for w in light):
+        score = max(score, 0.60)
+        hits += [w for w in light if has(w)]
+
+    # nếu có ngữ cảnh giáo dục kèm profanity -> nâng mức
+    if score >= 0.60 and any(has(c) for c in EDU_CTX):
+        score = max(score, 0.90)
+        hits.append("edu_ctx")
+
+    return score if hits else 0.0, hits
+
+def entropy(probs):
+    return -sum(p * math.log(p + 1e-12) for p in probs)
+
+# Profanity có dấu (ưu tiên match dạng này trước)
+RE_PROFAN_RAW = [
+    # --- mạnh / tục trực tiếp ---
+    r"\bđịt\b", r"\bđụ\b",
+    r"\bđịt\s+mẹ\b", r"\bđụ\s+mẹ\b", r"\bđù\s+má\b",
+    r"\bđéo\b", r"\bđếch\b", r"\béo\b",
+
+    r"\bcặc\b", r"\blồn\b", r"\bbuồi\b", r"\bvch\b",
+
+    # --- gia đình / chửi rủa ---
+    r"\bmẹ\s+mày\b", r"\bmá\s+mày\b", r"\bmẹ\s+kiếp\b", r"\bmả\s+mẹ\b",
+    r"\btổ\s+sư\b", r"\btổ\s+cha\b",
+
+    # --- xúc phạm nặng ---
+    r"\bóc\s+chó\b", r"\bchó\s+chết\b", r"\bđồ\s+chó\b",
+    r"\bkhốn\s+nạn\b", r"\bbố\s+láo\b", r"\bláo\s+(toét|chó)\b", r"\bđểu\s+cáng\b",
+    r"\bmất\s+dạy\b", r"\bvô\s+học\b", r"\brác\s+rưởi\b", r"\bđồ\s+rác\s+rưởi\b",
+
+    # --- xúc phạm vừa / miệt thị ---
+    r"\bngu\b", r"\bđần\b", r"\bđần\s+độn\b", r"\bngu\s+si\b",
+    r"\bnão\s+tàn\b", r"\bnão\s+phẳng\b",
+    r"\bsúc\s+vật\b", r"\bsúc\s+sinh\b",
+    r"\bbiến\s+thái\b",
+    r"\bđồ\s+thần\s+kinh\b",     # cụ thể để tránh FP “khoa thần kinh”
+
+    # --- đuổi / nạt nộ ---
+    r"\bcút\b", r"\bcút\s+(đi|xéo)\b",
+
+    # --- tiếng Anh phổ biến ---
+    r"\bshit+\b", r"\bf+u+c+k+\b", r"\bv+c+h+\b",
+
+    r"\bdit\b", r"\bdjt\b", r"\bdu\b",
+    r"\bcac+k\b", r"\blon\b", r"\bbuoi\b",
+    r"\boc cho\b", r"\boccho\b",
+    r"\bmeo+?\b",  # optional
+    r"\bmat net\b",            # ✨ mới
+    r"\bmat day\b",            # ✨
+    r"\bsuc vat\b", r"\bkhon nan\b", r"\bdo cho\b",
+    r"\bngu\b", r"\bdan+ do+n\b",
+]
+
+# Biến thể viết lách/ẩn từ (không dấu / chèn ký tự) – chỉ dùng khi bạn đã có “trigger” gần đó
+RE_PROFAN_OBFUSCATED = [
+    r"\bl[\W_]*[ôo0\*]+n\b",      # l*n, l0n -> lồn
+    r"\bb[u\*]+[ôo0][iíi]\b",     # bu*oi -> buồi
+    r"\bđ[\W_]*[ịi\*]+t\b",       # đ*t -> địt
+    r"\bc[\W_]*[ăa\*]+[ckq]+\b",  # c*ck -> cặc
+    r"\bd[ck]m+\b",               # dcm/dkm
+    r"\bcmm+\b",                  # cmm
+    r"\bvcl+\b", r"\bvl+\b",      # vcl/vl
+]
+
+# viết tắt/booster mức độ
+RE_BOOSTERS = [r"\bvcl\b", r"\bvl\b", r"\bvch\b", r"\bvcc\b"]
+# ngữ cảnh nhạy cảm (mục tiêu là nhà trường/giáo viên…)
+RE_EDU_CTX = [r"\bgiang vien\b", r"\bgiao vien\b", r"\btruong\b", r"\blop\b", r"\bban hoc\b"]
+
+RAW_PATTERNS = [re.compile(p) for p in RE_PROFAN_RAW]
+
+# Từ kích hoạt (dạng không dấu) để “mở khoá” kiểm tra không dấu
+TRIGGERS = {"dm","dmm","dcm","dkm","dit","djt","ditme","dcm","cmm","vcl","vl","ngu","oc","occho","cac","buoi","loz"}
+
+# Whitelist các ngữ cảnh an toàn
+SAFE_PHRASES_RAW = [
+    r"\bbuổi\b",                      # buổi học/buổi sáng...
+    r"\blớn\b",                       # l(ớ)n (không phải l*n)
+    r"\blon\s+(bia|nước|sữa)\b",      # lon bia/nước/sữa
+    r"\bvỏ\s+lon\b", r"\blon\s+thiếc\b"
+]
+SAFE_PATTERNS_RAW = [re.compile(p) for p in SAFE_PHRASES_RAW]
+
+def tokenize_ascii(s: str):
+    return [w for w in re.split(r"\W+", s) if w]
+
+def window_has_trigger(tokens, i, k=2):
+    L = max(0, i-k); R = min(len(tokens), i+k+1)
+    return any(t in TRIGGERS for t in tokens[L:R] if t)
+
+
+
+def lexicon_score(text: str):
+    """
+    Trả về (score, hits). Giảm false positive cho 'buoi'/'lon' khi nghĩa vô hại.
+    """
+    raw = (text or "").lower()
+    ascii_txt = normalize(text or "")   # đã bỏ dấu / chuẩn hoá
+    toks = tokenize_ascii(ascii_txt)
+
+    hits = set()
+    score = 0.0
+
+    # 1) ƯU TIÊN: match có dấu (ít false positive)
+    for pat in RAW_PATTERNS:
+        if pat.search(raw):
+            hits.add(pat.pattern)
+            score = max(score, 0.90)
+
+    # 2) BỎ QUA nếu rơi vào whitelist an toàn
+    for sp in SAFE_PATTERNS_RAW:
+        if sp.search(raw):
+            # ví dụ: có "buổi", "lon bia" -> đừng nâng score chỉ vì 'buoi/lon' ở ascii
+            # (không return ngay, vì có thể đồng thời chứa từ thô khác)
+            pass
+
+    # 3) DẠNG KHÔNG DẤU: chỉ xét khi có trigger ở gần
+    if score < 0.90:  # chưa bị match mạnh ở bước 1
+        for i, tok in enumerate(toks):
+            if tok in {"buoi", "lon"}:
+                # a) nếu bản có dấu chứa 'buổi' hoặc 'lớn' -> bỏ qua
+                if re.search(r"\bbuổi\b", raw) and tok == "buoi":
+                    continue
+                if re.search(r"\blớn\b", raw) and tok == "lon":
+                    continue
+                # b) nếu là các cụm “lon bia/vỏ lon…” -> bỏ qua
+                if re.search(r"\blon\s+(bia|nước|sữa)\b", raw) or re.search(r"\bvỏ\s+lon\b", raw):
+                    continue
+                # c) chỉ flag khi gần trigger
+                if window_has_trigger(toks, i, k=2):
+                    hits.add(tok)
+                    score = max(score, 0.80 if tok == "lon" else 0.75)
+
+            # các biến thể phổ biến khác dạng không dấu
+            if tok in {"dm","dmm","dcm","dkm","cmm","vcl","vl","dit","djt","ditme","occho"}:
+                hits.add(tok)
+                score = max(score, 0.80)
+
+            if tok == "ngu":
+                hits.add(tok)
+                score = max(score, 0.60)
+
+    # 4) Nâng mức khi có ngữ cảnh giáo dục + đã có bất kỳ hit tục
+    EDU_CTX = {"truong","lop","giao","giaovien","hocsinh","sinhvien","hieu","co giao","thay"}
+    if score >= 0.60 and any(c in ascii_txt for c in EDU_CTX):
+        score = max(score, 0.90)
+        hits.add("edu_ctx")
+
+    return (score if hits else 0.0, sorted(hits))
 
 # ========= Model I/O =========
 class PredictIn(BaseModel):
@@ -189,23 +378,17 @@ async def home():
                 <nav class="navbar container" data-navbar>
                     <ul class="navbar-list">
                         <li>
-                            <a href="index.php" class="navbar-link" data-nav-link>Home</a>
+                            <a href="#" class="navbar-link" data-nav-link>Home</a>
                         </li>
                         <li>
-                            <a href="#service" class="navbar-link" data-nav-link>Analyze</a>
+                            <a href="#analyze" class="navbar-link" data-nav-link>Analyze</a>
                         </li>
                         <li>
-                            <a href="#about" class="navbar-link" data-nav-link>Reports</a>
-                        </li>
-                        <li>
-                            <a href="#blog" class="navbar-link" data-nav-link>Blog</a>
-                        </li>
-                        <li>
-                            <a href="contact.php" class="navbar-link" data-nav-link>Contact</a>
+                            <a href="#contact" class="navbar-link" data-nav-link>Contact</a>
                         </li>
                     </ul>
                 </nav>
-                <a href="http://localhost/negative-info-guard/php/admin/login.php" class="btn">Login / Register</a>
+                <a href="http://localhost/negative-info-guard/php/admin/login.php" class="btn">Login</a>
 
                 <button class="nav-toggle-btn" aria-label="Toggle menu" data-nav-toggler>
                     <ion-icon name="menu-sharp" aria-hidden="true" class="menu-icon"></ion-icon>
@@ -247,22 +430,22 @@ async def home():
                         <h2 class="h2 section-title">
                             We Care About You</h2>
                         <p class="section-text section-text-1">
-                            Lorem ipsum dolor sit amet, consectetur adipisicing elit. Aliquid sint maxime recusandae
-                            porro autem. Quasi voluptatum temporibus alias, quaerat similique, ea provident repellendus
-                            dolore ipsam sit nihil iste natus quam.
+                            iCheck là trợ lý kiểm duyệt sử dụng AI và luật tiếng Việt giúp nhà trường, doanh nghiệp và cộng đồng
+  <strong>phát hiện sớm nội dung tiêu cực</strong>: tục tĩu, miệt thị, kích động, lừa đảo, đường link độc hại…
+  trên fanpage và bình luận. Chúng tôi muốn bạn <strong>an tâm truyền thông</strong>, còn việc “soi rủi ro” cứ để iCheck lo.
                         </p>
                         <p class="section-text">
-                            Lorem ipsum dolor sit amet consectetur, adipisicing elit. Cupiditate a rerum quidem laborum
-                            dignissimos corrupti neque id porro laboriosam amet ad fuga, accusantium cum odio provident.
-                            Ullam, cum maxime! Incidunt?
+                            Hệ thống <strong>tự động thu thập bài viết & bình luận</strong>, <strong>chấm điểm rủi ro theo thời gian thực</strong>,
+  cảnh báo tức thì và cung cấp bảng điều khiển trực quan để duyệt/gỡ/chỉnh chỉ với <strong>1 lần bấm</strong>.
+  Mọi thao tác đều được lưu vết, dữ liệu thuộc về bạn, và có thể tùy chỉnh danh sách từ nhạy cảm cho phù hợp bối cảnh giáo dục.
                         </p>
-                        <a href="about.html" class="btn">Read more About Us</a>
+                        <a class="btn" href="#analyze">Tìm hiểu về iCheck</a>
                     </div>
                 </div>
             </section>
 
             <!-- ANALYZE -->
-            <section class="section" id="service" style="padding:40px;">
+            <section class="section" id="analyze" style="padding:40px;">
                 <div class="container">
                 <h2 class="h2 section-title">
                             Phân tích bài viết</h2>
@@ -274,15 +457,15 @@ async def home():
         </main>
 
 <!--FOOTER-->
-    <footer class="footer">
+    <footer class="footer" id="contact">
         <div class="footer-top section">
             <div class="container">
                 <div class="footer-brand">
                     <a href="#" class="logo">iCheck</a>
                     <p class="footer-text">
-                        Lorem ipsum dolor sit amet, consectetur adipisicing elit. Architecto laudantium deserunt
-                        delectus quae beatae consequatur asperiores tempore libero laboriosam numquam, excepturi autem
-                        harum quasi iusto eaque nobis commodi doloremque corporis!
+                        iCheck là trợ lý kiểm duyệt nội dung cho fanpage và cộng đồng. Hệ thống tự động thu thập
+  bài viết & bình luận, chấm điểm rủi ro theo thời gian thực, cảnh báo tức thì và lưu vết xử lý.
+  Giúp bạn an tâm truyền thông – việc “soi rủi ro” cứ để iCheck lo.
                     </p>
                     <div class="schedule">
                         <div class="schedule-icon">
@@ -305,33 +488,21 @@ async def home():
                         </a>
                     </li>
                     <li>
-                        <a href="#" class="footer-link">
+                        <a href="#analyze" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
                             <span class="span">Analyze</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#" class="footer-link">
-                            <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">Reports</span>
-                        </a>
-                    </li>
-                    <li>
-                        <a href="#" class="footer-link">
-                            <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">Blog</span>
-                        </a>
-                    </li>
-                    <li>
-                        <a href="#" class="footer-link">
+                        <a href="#contact" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
                             <span class="span">Contact</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#" class="footer-link">
+                        <a href="http://localhost/negative-info-guard/php/admin/login.php" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">Login / Register</span>
+                            <span class="span">Login</span>
                         </a>
                     </li>
                 </ul>
@@ -342,37 +513,25 @@ async def home():
                     <li>
                         <a href="#" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">xxxxxxxxx</span>
+                            <span class="span">Thu thập post & comment tự động</span>
                         </a>
                     </li>
                     <li>
                         <a href="#" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">xxxxxxxxx</span>
+                            <span class="span">Chấm điểm rủi ro theo thời gian thực</span>
                         </a>
                     </li>
                     <li>
                         <a href="#" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">xxxxxxxxx</span>
+                            <span class="span">Bộ lọc tục tiếng Việt có thể tùy chỉnh</span>
                         </a>
                     </li>
                     <li>
                         <a href="#" class="footer-link">
                             <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">xxxxxxxxx</span>
-                        </a>
-                    </li>
-                    <li>
-                        <a href="#" class="footer-link">
-                            <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">xxxxxxxxx</span>
-                        </a>
-                    </li>
-                    <li>
-                        <a href="#" class="footer-link">
-                            <ion-icon name="add-outline"></ion-icon>
-                            <span class="span">xxxxxxxxx</span>
+                            <span class="span">API & Webhook để tích hợp hệ thống</span>
                         </a>
                     </li>
                 </ul>
@@ -442,61 +601,95 @@ async def home():
     <script nomodule src="https://unpkg.com/ionicons@5.5.2/dist/ionicons/ionicons.js"></script>
 
 
-        <script>
+       <script>
+function verdictFromRisk(r){
+  if (r >= 0.70) return {css:"danger", text:"🔴 Nguy hiểm", action:"🚫 Gỡ/ẩn ngay & soạn bình luận cảnh báo."};
+  if (r >= 0.40) return {css:"medium", text:"🟠 Cần duyệt", action:"✏️ Đưa vào hàng chờ duyệt, cân nhắc chỉnh/sửa từ ngữ."};
+  return {css:"safe", text:"🟢 An toàn", action:"✅ Có thể đăng."};
+}
+function confLabel(v){
+  if (v == null) return "Không rõ";
+  if (v >= 0.75) return "Cao";
+  if (v >= 0.55) return "Trung bình";
+  return "Thấp";
+}
+
+/* --- FIX: chuyển regex hit -> từ dễ đọc --- */
+function prettyHits(hitsRaw){
+  const map = {
+    "oc cho":"óc chó", "occho":"óc chó",
+    "ditme":"địt mẹ", "djtme":"địt mẹ", "dit":"địt",
+    "dm":"đm", "dmm":"đmm", "dcm":"đcm", "dkm":"đkm",
+    "vl":"vãi l", "vcl":"vcl"
+  };
+  const cleaned = [];
+  for (let h of (hitsRaw||[])){
+    if (h === "edu_ctx") continue;            // để UI ghi riêng "ngữ cảnh giáo dục"
+    let x = String(h);
+    x = x.replace(/\\\\b/g, "");              // JSON: \\b
+    x = x.replace(/\\b/g, "");                // fallback: \b
+    x = x.replace(/[\\^$.*+?()[\]{}|]/g, ""); // loại ký tự regex
+    x = x.replace(/\s+/g, " ").trim();
+    if (!x) continue;
+    x = map[x] || x;
+    cleaned.push(x);
+  }
+  // unique, tối đa 5 từ
+  return [...new Set(cleaned)].slice(0,5);
+}
+
+function topReasons(text, data){
+  const reasons = [];
+  const hitsPretty = prettyHits(data?.lexicon?.hits);
+  if (hitsPretty.length){
+    reasons.push("Từ ngữ vi phạm: " + hitsPretty.join(", "));
+  }
+  if ((data?.lexicon?.hits||[]).includes("edu_ctx")){
+    reasons.push("Ngữ cảnh nhạy cảm: trường/lớp/giáo viên");
+  }
+  if (/(https?:\/\/|www\.)/i.test(text)) reasons.push("Có liên kết – cần kiểm tra nguồn");
+  if (/[!]{2,}/.test(text)) reasons.push("Nhiều dấu cảm thán bất thường");
+
+  if (!reasons.length){
+    const r = data?.risk_score ?? 0;
+    reasons.push(r >= 0.7 ? "Mô hình cảnh báo rủi ro cao"
+                          : r >= 0.4 ? "Mô hình chưa chắc chắn – nên có người duyệt"
+                                     : "Không phát hiện vi phạm rõ ràng");
+  }
+  return reasons.slice(0,3);
+}
+
 async function analyze(){
   const elOut = document.getElementById("result");
   const text = (document.getElementById("inputText").value || "").trim();
   if(!text){ elOut.innerHTML = "<div class='result medium'>⚠️ Vui lòng nhập nội dung!</div>"; return; }
 
   try{
-    const res = await fetch("/predict", {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ text })
-    });
-    const data = await res.json(); // <-- BẮT BUỘC: lấy data từ res
+    const res  = await fetch("/predict",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+    const data = await res.json();
 
-    const risk = data.risk_score ?? 0;
-    const label = data.label ?? "-";
-    const confidence = data.confidence ?? Math.max(...Object.values(data.proba || { [label]: 1 }));
-    const margin = data.margin ?? 0;
-    const entropy = data.entropy ?? 0;
-    const lowConf = data.low_confidence ?? (confidence < 0.6 || margin < 0.2);
-
-    let cssClass = "safe", status = "🟢 An toàn";
-    if (risk < 0.4) { cssClass = "safe"; status = "🟢 An toàn"; }
-    else if (risk < 0.7) { cssClass = "medium"; status = lowConf ? "🟠 Nghi ngờ (cần duyệt)" : "🟡 Trung bình"; }
-    else { cssClass = "danger"; status = "🔴 Nguy hiểm"; }
+    const risk = data?.risk_score ?? 0;
+    const v    = verdictFromRisk(risk);
+    const conf = confLabel(data?.ml?.p_max ?? data?.confidence ?? null);
+    const reasons = topReasons(text, data);
 
     elOut.innerHTML = `
-      <div class="result ${cssClass}">
-        <p><b>📝 Kết quả phân tích:</b></p>
-        <ul style="margin:0;padding-left:18px;">
-          <li><b>Label:</b> ${label}</li>
-          <li><b>Độ rủi ro:</b> ${(risk*100).toFixed(1)}%</li>
-          <li><b>Độ tin cậy (p_max):</b> ${(confidence*100).toFixed(1)}%</li>
-          <li><b>Biên (margin):</b> ${(margin*100).toFixed(1)}%</li>
-          <li><b>Độ mơ hồ (entropy):</b> ${(entropy*100).toFixed(1)}%</li>
-          <li><b>Mức cảnh báo:</b> ${status}</li>
-          <li><b>Khuyến nghị:</b>
-            ${
-              lowConf
-                ? "🟠 Mô hình chưa chắc chắn — vui lòng người duyệt xem lại."
-                : (risk < 0.4
-                    ? "✅ Nội dung an toàn, có thể đăng."
-                    : risk < 0.7
-                      ? "⚠️ Cần xem xét trước khi đăng."
-                      : "🚨 Nội dung tiêu cực, cần gỡ/kiểm duyệt gấp!")
-            }
-          </li>
-          <li><b>Thời gian phân tích:</b> ${new Date().toLocaleString()}</li>
-        </ul>
+      <div class="result ${v.css}">
+        <div style="font-size:18px;margin-bottom:6px;"><b>${v.text}</b> • Độ tin cậy: ${conf}</div>
+        <div><b>Lý do chính:</b>
+          <ul style="margin:6px 0 10px;padding-left:18px;">
+            ${reasons.map(r=>`<li>${r}</li>`).join("")}
+          </ul>
+        </div>
+        <div><b>Gợi ý xử lý:</b> ${v.action}</div>
       </div>`;
   }catch(e){
     elOut.innerHTML = "<div class='result danger'>❌ Lỗi kết nối tới API!</div>";
   }
 }
 </script>
+
+
 </body></html>
 """
 
@@ -505,48 +698,54 @@ async function analyze(){
 def healthz():
     return {"status":"ok"}
 
-@app.post("/predict", response_model=PredictOut)
-def predict(inp: PredictIn, x_api_key: Optional[str] = Header(default=None)):
-    # Nếu đặt API_KEY thì yêu cầu header
-    if API_KEY and (not x_api_key or x_api_key != API_KEY):
-        raise HTTPException(401, "Invalid or missing API key.")
+@app.post("/predict")
+def predict(inp: Inp):
+    text = inp.text or ""
+    # ----- ML -----
+    ml_label = "neutral"
+    ml_prob_toxic = 0.0
+    pmax = 1.0
+    margin = 1.0
+    ent = 0.0
 
-    text = (inp.text or "").strip()
-    if not text:
-        raise HTTPException(400, "Text is required.")
+    if pipe is not None:
+        try:
+            if hasattr(pipe, "predict_proba"):
+                probs = pipe.predict_proba([text])[0]
+                # giả sử lớp 1 = "toxic/unsafe"; nếu khác, map theo pipe.classes_
+                if hasattr(pipe, "classes_"):
+                    idx = list(pipe.classes_).index(1) if 1 in getattr(pipe, "classes_", []) else int(len(probs) - 1)
+                else:
+                    idx = int(len(probs) - 1)
+                ml_prob_toxic = float(probs[idx])
+                p_sorted = sorted(probs, reverse=True)
+                pmax = float(p_sorted[0])
+                margin = float(p_sorted[0] - (p_sorted[1] if len(p_sorted) > 1 else 0.0))
+                ent = float(entropy(probs))
+                ml_label = "unsafe" if ml_prob_toxic >= THRESHOLD else "neutral"
+            else:
+                pred = pipe.predict([text])[0]
+                ml_label = str(pred)
+        except Exception:
+            pass
 
-    label = PIPE.predict([text])[0]
+    # ----- Lexicon -----
+    lex_score, hits = lexicon_score(text)
 
-    # Phân bố xác suất
-    proba: Dict[str, float] = {}
-    probs, classes = [], []
-    if hasattr(PIPE, "predict_proba"):
-        probs = PIPE.predict_proba([text])[0].tolist()
-        classes = _classes_from(PIPE) or ["negative","neutral","positive"][:len(probs)]
-        proba = {classes[i]: float(probs[i]) for i in range(len(probs))}
-    else:
-        proba, probs = {label: 1.0}, [1.0]
+    # ----- Fuse -----
+    risk_score = max(ml_prob_toxic, lex_score)
+    label = "unsafe" if risk_score >= THRESHOLD else "neutral"
 
-    # Các đại lượng từ phân bố
-    p_neg = float(proba.get("negative", 0.0))
-    p_sorted = sorted(probs, reverse=True)
-    p_max = float(p_sorted[0])
-    p_second = float(p_sorted[1]) if len(p_sorted) > 1 else 0.0
-    margin = p_max - p_second
-    ent = _entropy(probs)
-
-    # Risk tổng hợp (dựa trên xác suất đã calibrate nếu bạn train bằng CalibratedClassifierCV)
-    risk = W_NEG*p_neg + W_UNC_MARGIN*(1 - margin) + W_UNC_ENTROPY*ent
-    risk = max(0.0, min(1.0, risk))
-
-    low_conf = (p_max < CONFIDENCE_THRESHOLD) or (margin < MARGIN_THRESHOLD)
-
-    return PredictOut(
-        label=label,
-        proba=proba,
-        risk_score=risk,
-        confidence=p_max,
-        margin=margin,
-        entropy=ent,
-        low_confidence=low_conf,
-    )
+    return {
+        "label": label,
+        "risk_score": round(risk_score, 4),
+        "ml": {
+            "label": ml_label,
+            "p_toxic": round(ml_prob_toxic, 4),
+            "p_max": round(pmax, 4),
+            "margin": round(margin, 4),
+            "entropy": round(ent, 4),
+        },
+        "lexicon": {"score": lex_score, "hits": hits},
+        "threshold": THRESHOLD,
+    }
