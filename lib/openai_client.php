@@ -245,78 +245,110 @@ function _dedupe_warnings(array $list): array
 // Hợp nhất kết quả LLM + luật, tính lại risk
 function _apply_prescreen_and_normalize(array $parsed, array $screen): array
 {
-    // Ánh xạ nhãn theo cờ luật
-    if ($screen['flags']['harassment']) $parsed['labels']['hate_speech'] = true;
+    // 1) Đồng bộ nhãn từ heuristic → labels
+    if ($screen['flags']['harassment']) $parsed['labels']['hate_speech']   = true;
     if ($screen['flags']['scam'] || $screen['flags']['money_lure'] || $screen['flags']['sexual'])
         $parsed['labels']['scam_phishing'] = true;
 
-    // Chuẩn hoá trước
+    // 2) Chuẩn hoá đầu tiên (đảm bảo đủ trường)
     $norm = _normalize_analysis($parsed);
 
-    // >>> CHỈ DÙNG CẢNH BÁO TỪ LUẬT <<<
-    $w = [];
-    if ($screen['flags']['harassment']) {
-        $ev = $screen['evidence']['harassment'] ?? [];
-        $w[] = [
-            'title' => 'Ngôn từ xúc phạm/công kích',
-            'severity' => 'high',
-            'evidence' => $ev ? ('Từ ngữ: ' . implode(', ', array_slice($ev, 0, 5))) : 'Từ ngữ xúc phạm',
-            'suggestion' => 'Giữ văn minh, tránh công kích cá nhân.'
-        ];
+    // 3) Bắt đầu gộp cảnh báo theo tiêu đề (title tiếng Việt)
+    //    bucket[title] = ['title'=>..., 'severity'=>..., 'evidence'=>[], 'suggestion'=>...]
+    $bucket = [];
+
+    // Helper gộp
+    $mergeWarn = function ($title, $severity, $evidence = '', $suggestion = '') use (&$bucket) {
+        $title = trim($title);
+        $severity = in_array($severity, ['low', 'medium', 'high', 'critical'], true) ? $severity : 'low';
+        if (!isset($bucket[$title])) {
+            $bucket[$title] = [
+                'title' => $title,
+                'severity' => $severity,
+                'evidence' => [],
+                'suggestion' => $suggestion ?: 'Vui lòng giữ văn minh, kiểm chứng nguồn; cảnh giác mời chào/đường link.'
+            ];
+        } else {
+            // giữ severity cao nhất
+            $rank = ['low' => 1, 'medium' => 2, 'high' => 3, 'critical' => 4];
+            if ($rank[$severity] > $rank[$bucket[$title]['severity']]) {
+                $bucket[$title]['severity'] = $severity;
+            }
+        }
+        if ($evidence) $bucket[$title]['evidence'][] = $evidence;
+    };
+
+    // 3a) Gộp cảnh báo từ LLM (nếu có)
+    foreach ($norm['warnings'] as $w) {
+        $t = mb_strtolower($w['title'] ?? '');
+        // Suy ra tag theo title tiếng Anh nếu có
+        if (strpos($t, 'hate') !== false)           $title = _vn_title_for('hate_speech');
+        elseif (strpos($t, 'scam') !== false || strpos($t, 'phishing') !== false)
+            $title = _vn_title_for('scam_phishing');
+        elseif (strpos($t, 'misinfo') !== false)    $title = _vn_title_for('misinformation');
+        elseif (strpos($t, 'violence') !== false)   $title = _vn_title_for('violence_threat');
+        elseif (strpos($t, 'propaganda') !== false) $title = _vn_title_for('propaganda');
+        else                                        $title = _vn_title_for('other');
+
+        $mergeWarn($title, $w['severity'] ?? 'low', trim($w['evidence'] ?? ''), trim($w['suggestion'] ?? ''));
     }
-    if ($screen['flags']['bribery']) {
-        $ev = $screen['evidence']['bribery'] ?? [];
-        $w[] = [
-            'title' => 'Cáo buộc phong bì/hối lộ',
-            'severity' => 'high',
-            'evidence' => $ev ? ('Từ khoá: ' . implode(', ', array_slice($ev, 0, 5))) : '“phong bì/lót tay/đi tiền”',
-            'suggestion' => 'Không cáo buộc khi thiếu chứng cứ; nếu có nguồn, hãy dẫn link chính thống.'
-        ];
+
+    // 3b) Gộp cảnh báo từ heuristic (rõ ràng, có tiêu đề Việt hoá)
+    if ($screen['flags']['harassment']) {
+        foreach ($screen['reasons'] as $r) {
+            if (mb_stripos($r, 'xúc phạm') !== false) {
+                $mergeWarn(_vn_title_for('hate_speech'), 'high', $r);
+            }
+        }
+    }
+    if ($screen['flags']['scam']) {
+        foreach ($screen['reasons'] as $r) {
+            if (mb_stripos($r, 'đa cấp') !== false || mb_stripos($r, 'lừa') !== false || mb_stripos($r, 'mời chào') !== false) {
+                $mergeWarn(_vn_title_for('scam_phishing'), 'high', $r);
+            }
+        }
     }
     if ($screen['flags']['sexual']) {
-        $ev = $screen['evidence']['sexual'] ?? [];
-        $w[] = [
-            'title' => 'Rủ rê nội dung nhạy cảm',
-            'severity' => 'high',
-            'evidence' => $ev ? ('Từ khoá: ' . implode(', ', array_slice($ev, 0, 5))) : 'mại dâm/clip nóng…',
-            'suggestion' => 'Tránh phát tán; cảnh giác link/nhóm lạ.'
-        ];
+        foreach ($screen['reasons'] as $r) {
+            if (mb_stripos($r, 'tình dục') !== false || mb_stripos($r, 'mại dâm') !== false || mb_stripos($r, 'clip nóng') !== false) {
+                $mergeWarn(_vn_title_for('scam_phishing'), 'medium', $r); // đẩy qua scam vì rủi ro link/câu kéo
+            }
+        }
     }
     if ($screen['flags']['link']) {
-        $ev = $screen['evidence']['link'] ?? [];
-        $w[] = [
-            'title' => 'Liên kết ngoài/miền rủi ro',
-            'severity' => 'medium',
-            'evidence' => $ev ? ('Link: ' . implode(', ', array_slice($ev, 0, 3))) : 'Có liên kết ngoài',
-            'suggestion' => 'Không bấm link lạ; kiểm tra tên miền; báo cáo nếu nghi ngờ.'
-        ];
+        $mergeWarn('Liên kết ngoài', 'medium', 'Có liên kết ngoài/URL.');
     }
     if ($screen['flags']['phone']) {
-        $ev = $screen['evidence']['phone'] ?? [];
-        $w[] = [
-            'title' => 'Số liên hệ công khai',
-            'severity' => 'low',
-            'evidence' => $ev ? ('Số: ' . implode(', ', $ev)) : 'Có số điện thoại',
-            'suggestion' => 'Tránh chia sẻ thông tin cá nhân trong bình luận.'
+        $mergeWarn('Số điện thoại', 'low', 'Có số điện thoại.');
+    }
+
+    // 4) Chuyển bucket → warnings (evidence gộp)
+    $warnings = [];
+    foreach ($bucket as $title => $w) {
+        $warnings[] = [
+            'title'      => $title,
+            'severity'   => $w['severity'],
+            'evidence'   => _join_evidence($w['evidence']),
+            'suggestion' => $w['suggestion'],
         ];
     }
-    // Ghi đè hoàn toàn warnings từ model
-    $norm['warnings'] = $w;
+    // sắp xếp: critical > high > medium > low
+    usort($warnings, function ($a, $b) {
+        $rank = ['critical' => 4, 'high' => 3, 'medium' => 2, 'low' => 1];
+        return $rank[$b['severity']] <=> $rank[$a['severity']];
+    });
+    $norm['warnings'] = $warnings;
 
-    // TÍNH LẠI RISK (giữ công thức tổng hợp bạn đang dùng)
+    // 5) Tính lại risk gộp (giữ nguyên công thức + heuristic)
     $norm['_model_score'] = (isset($parsed['overall_risk']) && is_numeric($parsed['overall_risk'])) ? (int)$parsed['overall_risk'] : 0;
-    $norm['overall_risk']  = _compute_composite_risk($norm, $screen, $parsed);
+    $norm['overall_risk'] = _compute_composite_risk($norm, $screen, $parsed);
 
-    // >>> MỨC SÀN THEO CỜ LUẬT <<<
-    if (!empty($screen['flags']['sexual']))   $norm['overall_risk'] = max($norm['overall_risk'], 75);
-    if (!empty($screen['flags']['bribery']))  $norm['overall_risk'] = max($norm['overall_risk'], 65);
-    if (!empty($screen['flags']['harassment'])) $norm['overall_risk'] = max($norm['overall_risk'], 45);
-
-    // Quyết định chia sẻ
     $shareTh = (int) envv('SAFE_SHARE_THRESHOLD', 45);
     $norm['safe_to_share'] = $norm['overall_risk'] <= $shareTh;
+
     return $norm;
 }
+
 
 
 
@@ -423,6 +455,35 @@ function _normalize_analysis(array $x): array
     return $out;
 }
 
+// Việt hoá tiêu đề theo nhãn/flag
+function _vn_title_for($tag)
+{
+    switch ($tag) {
+        case 'hate_speech':
+            return 'Ngôn từ xúc phạm/công kích';
+        case 'scam_phishing':
+            return 'Mời chào/lừa đảo/phishing';
+        case 'misinformation':
+            return 'Thông tin thiếu kiểm chứng';
+        case 'violence_threat':
+            return 'Kích động/đe doạ bạo lực';
+        case 'propaganda':
+            return 'Tuyên truyền/phiến diện';
+        default:
+            return 'Dấu hiệu rủi ro';
+    }
+}
+
+// Nối bằng chứng thành danh sách gọn gàng
+function _join_evidence(array $items)
+{
+    $items = array_values(array_unique(array_filter(array_map('trim', $items))));
+    if (!$items) return '';
+    // mỗi dòng một dấu •
+    return "• " . implode("\n• ", $items);
+}
+
+
 function _compute_composite_risk(array $norm, array $screen, ?array $origParsed): int
 {
     // Trọng số có thể chỉnh qua .env
@@ -461,123 +522,191 @@ function _compute_composite_risk(array $norm, array $screen, ?array $origParsed)
 function analyze_text_with_schema($text)
 {
     $model = envv('OPENAI_MODEL', 'llama-3.1-8b-instant');
-    $pres  = _pre_screen_text($text); // ← quét luật trước
-
-    // Nếu đã có dấu hiệu mạnh -> trả kết quả theo luật (ổn định, không gọi model)
-    if ($pres['flags']['bribery'] || $pres['flags']['sexual'] || $pres['flags']['harassment']) {
-        $parsed = [
-            'overall_risk'  => null,
-            'labels'        => [
-                'misinformation'  => false,
-                'propaganda'      => [],
-                'scam_phishing'   => ($pres['flags']['bribery'] || $pres['flags']['sexual']),
-                'hate_speech'     => $pres['flags']['harassment'],
-                'violence_threat' => false,
-            ],
-            'flagged_terms' => [],
-            'warnings'      => [],   // sẽ được xây lại bằng luật ở _apply_prescreen_and_normalize
-            'safe_to_share' => null,
-            'notes'         => 'rule_only'
-        ];
-        $norm = _apply_prescreen_and_normalize($parsed, $pres);
-
-        // nâng sàn tuyệt đối lần nữa cho chắc
-        if ($pres['flags']['sexual'])    $norm['overall_risk'] = max($norm['overall_risk'], 80);
-        if ($pres['flags']['bribery'])   $norm['overall_risk'] = max($norm['overall_risk'], 70);
-        if ($pres['flags']['harassment']) $norm['overall_risk'] = max($norm['overall_risk'], 50);
-
-        return $norm;
-    }
 
     $jsonSchema = [
         'type' => 'object',
         'additionalProperties' => false,
         'properties' => [
-            'overall_risk' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 100],
-            'labels' => [
+            'scores' => [
                 'type' => 'object',
                 'additionalProperties' => false,
                 'properties' => [
-                    'misinformation'  => ['type' => 'boolean'],
-                    'propaganda'      => ['type' => 'array', 'items' => ['type' => 'string']],
-                    'scam_phishing'   => ['type' => 'boolean'],
-                    'hate_speech'     => ['type' => 'boolean'],
-                    'violence_threat' => ['type' => 'boolean'],
+                    'misinformation'  => ['type' => 'number', 'minimum' => 0, 'maximum' => 100],
+                    'propaganda'      => ['type' => 'number', 'minimum' => 0, 'maximum' => 100],
+                    'scam_phishing'   => ['type' => 'number', 'minimum' => 0, 'maximum' => 100],
+                    'hate_speech'     => ['type' => 'number', 'minimum' => 0, 'maximum' => 100],
+                    'violence_threat' => ['type' => 'number', 'minimum' => 0, 'maximum' => 100],
                 ],
                 'required' => ['misinformation', 'propaganda', 'scam_phishing', 'hate_speech', 'violence_threat']
             ],
-            'flagged_terms' => ['type' => 'array', 'items' => ['type' => 'string']],
-            'warnings' => [
-                'type' => 'array',
-                'items' => [
-                    'type' => 'object',
-                    'additionalProperties' => false,
-                    'properties' => [
-                        'title'      => ['type' => 'string'],
-                        'severity'   => ['type' => 'string', 'enum' => ['low', 'medium', 'high', 'critical']],
-                        'evidence'   => ['type' => 'string'],
-                        'suggestion' => ['type' => 'string'],
-                    ],
-                    'required' => ['title', 'severity', 'evidence', 'suggestion']
-                ]
+            'severity_hint' => ['type' => 'number', 'minimum' => 0, 'maximum' => 100],
+            'evidence_spans' => [
+                'type' => 'object',
+                'additionalProperties' => false,
+                'properties' => [
+                    'misinformation'  => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'propaganda'      => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'scam_phishing'   => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'hate_speech'     => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'violence_threat' => ['type' => 'array', 'items' => ['type' => 'string']],
+                ],
+                'required' => ['misinformation', 'propaganda', 'scam_phishing', 'hate_speech', 'violence_threat']
             ],
-            'safe_to_share' => ['type' => 'boolean'],
-            'notes'         => ['type' => 'string'],
+            'rewrite_suggestion' => ['type' => 'string'],
         ],
-        'required' => ['overall_risk', 'labels', 'flagged_terms', 'warnings', 'safe_to_share', 'notes']
+        'required' => ['scores', 'severity_hint', 'evidence_spans', 'rewrite_suggestion']
     ];
-    $prompt =
-        "Bạn là hệ thống kiểm tra rủi ro nội dung MXH.\n" .
-        "Chỉ đánh giá theo các nhóm: tin giả/thiếu nguồn, mời chào/lừa đảo, xúc phạm/công kích, kích động bạo lực, nội dung nhạy cảm, liên kết rủi ro, thông tin cá nhân.\n" .
-        "Không suy đoán về chính trị, tội phạm, cơ quan nhà nước… nếu văn bản KHÔNG nêu rõ. Không thêm cảnh báo không có bằng chứng trong văn bản.\n" .
-        "Trả JSON đúng schema, không thêm chữ khác.\n";
 
-    // 1) Structured Outputs
-    try {
-        $resp = openai_post('/responses', [
-            'model' => $model,
-            'input' => [
-                ['role' => 'system', 'content' => $prompt],
-                ['role' => 'user', 'content' => $text],
-            ],
-            'text' => [
-                'format' => [
-                    'type'   => 'json_schema',
-                    'name'   => 'RiskAnalysis',
-                    'schema' => $jsonSchema
-                ]
-            ],
-            'temperature' => 0,
-            'top_p' => 1,
-            'store' => false,
-        ]);
-        $out = _extract_text_from_response($resp);
-        $parsed = $out ? _json_from_text_loose($out) : null;
-        if ($parsed) return _apply_prescreen_and_normalize($parsed, $pres);
-    } catch (Exception $e) { /* fallback */
-    }
+    // tiền xử lý heuristics sẵn có của bạn
+    $pres  = _pre_screen_text($text);
 
-    // 2) Fallback: ép JSON bằng prompt thường
-    $schemaForPrompt = json_encode($jsonSchema, JSON_UNESCAPED_UNICODE);
-    $resp2 = openai_post('/responses', [
+    $rubric = <<<TXT
+Bạn là bộ chấm điểm rủi ro nội dung MXH (tiếng Việt).
+Chấm điểm 0–100 cho từng hạng mục: misinfo, propaganda, scam/phishing, hate speech, violence/threat.
+Quy tắc:
+- 0–20: hầu như không có dấu hiệu; 21–40: có dấu hiệu nhẹ/ẩn; 41–60: đáng chú ý; 61–80: cao; 81–100: rất cao/rõ rệt.
+- Chỉ dùng bằng chứng trong văn bản. Nếu thiếu dữ liệu, cho điểm thấp.
+- Ánh xạ gợi ý từ tiền xử lý (heuristic) sau vào điểm, nhưng vẫn ưu tiên bằng chứng:
+  FLAGS: %s
+- Trả về JSON đúng schema; KHÔNG thêm chữ thừa.
+TXT;
+
+    $prompt = sprintf($rubric, json_encode($pres['flags'], JSON_UNESCAPED_UNICODE));
+
+    // Gọi Responses API dạng structured (json_schema)
+    $resp = openai_post('/responses', [
         'model' => $model,
         'input' => [
-            [
-                'role' => 'system',
-                'content' =>
-                "Chỉ trả về MỘT đối tượng JSON, không chữ thừa.\n" .
-                    "Tuân thủ hoàn toàn schema sau:\n$schemaForPrompt\n" .
-                    "Gợi ý tiền xử lý: " . json_encode($pres['flags'])
-            ],
-            ['role' => 'user', 'content' => $text],
+            ['role' => 'system', 'content' => $prompt],
+            ['role' => 'user',   'content' => $text],
         ],
-        'text' => ['format' => ['type' => 'text']],
-        'temperature' => 0,
-        'top_p' => 1,
-        'store' => false,
+        'temperature' => (float) envv('LLM_TEMPERATURE', 0.2), // giảm dao động
+        'top_p'       => (float) envv('LLM_TOP_P', 0.3),
+        'text' => [
+            'format' => [
+                'type'   => 'json_schema',
+                'name'   => 'RiskScoring',
+                'schema' => $jsonSchema
+            ]
+        ],
     ]);
-    $out2 = _extract_text_from_response($resp2);
-    $parsed2 = $out2 ? _json_from_text_loose($out2) : null;
 
-    return _apply_prescreen_and_normalize($parsed2 ?: [], $pres);
+    $out = _extract_text_from_response($resp);
+    $parsed = $out ? _json_from_text_loose($out) : null;
+    if (!$parsed) $parsed = ['scores' => ['misinformation' => 0, 'propaganda' => 0, 'scam_phishing' => 0, 'hate_speech' => 0, 'violence_threat' => 0], 'severity_hint' => 0, 'evidence_spans' => ['misinformation' => [], 'propaganda' => [], 'scam_phishing' => [], 'hate_speech' => [], 'violence_threat' => []], 'rewrite_suggestion' => ''];
+
+    // Hợp nhất với heuristics + chuẩn hoá
+    $norm = _post_calibrate_scores($parsed, $pres);
+    return $norm;
+}
+
+
+function _post_calibrate_scores(array $modelOut, array $pres): array
+{
+    // 1) lấy điểm từng nhãn
+    $S = $modelOut['scores'] ?? [];
+    $mis = max(0, min(100, (float)($S['misinformation']  ?? 0)));
+    $pro = max(0, min(100, (float)($S['propaganda']      ?? 0)));
+    $scm = max(0, min(100, (float)($S['scam_phishing']   ?? 0)));
+    $hat = max(0, min(100, (float)($S['hate_speech']     ?? 0)));
+    $vio = max(0, min(100, (float)($S['violence_threat'] ?? 0)));
+
+    // 2) “đẩy nhẹ” theo heuristic flags (±5–15 tuỳ flag)
+    $boost = 0;
+    $flags = $pres['flags'] ?? [];
+    if (!empty($flags['scam'])) {
+        $scm += 12;
+        $boost += 4;
+    }
+    if (!empty($flags['money_lure'])) {
+        $scm += 8;
+        $boost += 2;
+    }
+    if (!empty($flags['harassment'])) {
+        $hat += 10;
+        $boost += 3;
+    }
+    if (!empty($flags['sexual'])) {
+        $hat += 6;
+        $boost += 1;
+    }
+    if (!empty($flags['link'])) {
+        $mis += 4;
+        $boost += 1;
+    }
+
+    $mis = max(0, min(100, $mis));
+    $pro = max(0, min(100, $pro));
+    $scm = max(0, min(100, $scm));
+    $hat = max(0, min(100, $hat));
+    $vio = max(0, min(100, $vio));
+
+    // 3) công thức tổng hợp LIÊN TỤC (không bậc thang)
+    //   - nhấn mạnh max rủi ro + top2 + severity_hint + heur_score chuẩn hoá
+    $sev = max(0, min(100, (float)($modelOut['severity_hint'] ?? 0)));
+    $arr = [$mis, $pro, $scm, $hat, $vio];
+    rsort($arr); // giảm dần
+    $max1 = $arr[0];
+    $max2 = $arr[1] ?? 0;
+    $avgTop2 = ($max1 + $max2) / 2;
+
+    $heur  = max(0, min(100, (float)($pres['heur_score'] ?? 0)));
+    $heurN = min(100, 20 + 0.8 * $heur); // ép về 20..100 để có “độ nền”
+
+    // Trọng số có thể tinh chỉnh qua .env
+    $w1 = (float) envv('RISK_W_MAX',    0.45);
+    $w2 = (float) envv('RISK_W_TOP2',   0.25);
+    $w3 = (float) envv('RISK_W_SEV',    0.15);
+    $w4 = (float) envv('RISK_W_HEUR',   0.15);
+
+    $sum = max(1e-6, $w1 + $w2 + $w3 + $w4);
+    $w1 /= $sum;
+    $w2 /= $sum;
+    $w3 /= $sum;
+    $w4 /= $sum;
+
+    $score = $w1 * $max1 + $w2 * $avgTop2 + $w3 * $sev + $w4 * $heurN;
+
+    // 4) làm mịn (smoothing) để đỡ “tụ” 0/50/70: logistic nhẹ
+    $k = 0.035; // độ cong, chỉnh tuỳ dữ liệu
+    $smoothed = 100.0 / (1.0 + exp(-$k * ($score - 50)));
+
+    // 5) trả kết quả chuẩn hóa + bằng chứng
+    $out = [
+        'overall_risk' => (int) round($smoothed),
+        'labels' => [
+            'misinformation'  => $mis >= 50,
+            'propaganda'      => $pro >= 50,
+            'scam_phishing'   => $scm >= 50,
+            'hate_speech'     => $hat >= 50,
+            'violence_threat' => $vio >= 50,
+        ],
+        'per_label_scores' => [
+            'misinformation'  => round($mis, 1),
+            'propaganda'      => round($pro, 1),
+            'scam_phishing'   => round($scm, 1),
+            'hate_speech'     => round($hat, 1),
+            'violence_threat' => round($vio, 1),
+        ],
+        'severity_hint' => round($sev, 1),
+        'flagged_terms' => [], // bạn có thể map thêm từ _pre_screen_text
+        'warnings' => [],      // có thể dựng từ evidence_spans
+        'safe_to_share' => ($smoothed <= (int)envv('SAFE_SHARE_THRESHOLD', 45)),
+        'notes' => 'calibrated_v2'
+    ];
+
+    // bằng chứng: lấy top 1–2 câu mỗi nhãn
+    $ev = $modelOut['evidence_spans'] ?? [];
+    foreach (['misinformation', 'propaganda', 'scam_phishing', 'hate_speech', 'violence_threat'] as $k) {
+        foreach (array_slice($ev[$k] ?? [], 0, 2) as $span) {
+            $out['warnings'][] = [
+                'title' => "Bằng chứng: $k",
+                'severity' => ($out['per_label_scores'][$k] >= 70 ? 'high' : ($out['per_label_scores'][$k] >= 50 ? 'medium' : 'low')),
+                'evidence' => (string)$span,
+                'suggestion' => (string)($modelOut['rewrite_suggestion'] ?? '')
+            ];
+        }
+    }
+
+    return $out;
 }

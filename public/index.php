@@ -141,6 +141,52 @@ send_security_headers();
                     </div>
                 </div>
             </section>
+            <style>
+                .card {
+                    background: linear-gradient(135deg, #f8d7da, #f1b0b7);
+                    color: #721c24;
+                    padding: 20px 25px;
+                    border-radius: 12px;
+                    border: 1px solid #f5c6cb;
+                    box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1);
+                    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+                    max-width: 600px;
+                    margin: 10px 0 10px 0;
+                    text-align: left;
+                    animation: fadeIn 0.4s ease-in-out;
+                    position: relative;
+                }
+
+                /* Tiêu đề trong thẻ */
+                .card h3 {
+                    margin-top: 0;
+                    font-size: 18px;
+                    font-weight: 600;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+
+                /* Nội dung chi tiết */
+                .card p {
+                    margin: 8px 0 0 0;
+                    font-size: 15px;
+                    line-height: 1.6;
+                }
+
+                /* Hiệu ứng xuất hiện */
+                @keyframes fadeIn {
+                    from {
+                        opacity: 0;
+                        transform: translateY(-5px);
+                    }
+
+                    to {
+                        opacity: 1;
+                        transform: translateY(0);
+                    }
+                }
+            </style>
 
             <!-- ANALYZE -->
             <section class="section" id="analyze" style="padding:40px;">
@@ -153,8 +199,10 @@ send_security_headers();
                     </form>
                     <section id="result" hidden>
                         <h2>Kết quả</h2>
-                        <div id="risk"></div>
-                        <div id="warnings"></div>
+                        <div>
+                            <div id="risk"></div>
+                            <div id="warnings"></div>
+                        </div>
                     </section>
                 </div>
             </section>
