@@ -111,81 +111,214 @@ function _vi_norm($s)
     $s = mb_strtolower($s, 'UTF-8');
     if (function_exists('iconv')) {
         $x = @iconv('UTF-8', 'ASCII//TRANSLIT', $s);
-        if ($x !== false) $s = $x;
+        if ($x !== false) $s = $x; // "đm" -> "dm", "óc chó" -> "oc cho"
     }
     $s = preg_replace('/[^a-z0-9@:\.\/\-\s]/', ' ', $s);
     return preg_replace('/\s+/', ' ', trim($s));
+}
+
+// trả true nếu regex (cho chuỗi đã chuẩn hóa và/hoặc chuỗi gốc) khớp
+function _has_kw(string $norm, string $orig, string $re_norm, ?string $re_utf = null): bool
+{
+    if (preg_match($re_norm, $norm)) return true;
+    if ($re_utf && preg_match($re_utf, $orig)) return true;
+    return false;
+}
+// gom bằng chứng khớp regex (ưu tiên có dấu, nếu không có thì lấy không dấu)
+function _collect_ev(string $norm, string $orig, string $re_norm, ?string $re_utf = null): array
+{
+    $m = [];
+    if ($re_utf && preg_match_all($re_utf, $orig, $m) && !empty($m[0])) return array_values(array_unique($m[0]));
+    $m = [];
+    if (preg_match_all($re_norm, $norm, $m) && !empty($m[0])) return array_values(array_unique($m[0]));
+    return [];
 }
 
 // Quét luật đơn giản: xúc phạm, lừa đảo/đa cấp, mồi tiền, link, SĐT
 function _pre_screen_text($text)
 {
     $t = _vi_norm($text);
-    $flags = ['harassment' => false, 'scam' => false, 'money_lure' => false, 'link' => false, 'phone' => false];
+
+    $flags = ['harassment' => false, 'scam' => false, 'money_lure' => false, 'sexual' => false, 'bribery' => false, 'link' => false, 'phone' => false];
+    $ev = ['harassment' => [], 'bribery' => [], 'sexual' => [], 'link' => [], 'phone' => []];
     $reasons = [];
+    $heur = 0;
 
-    if (preg_match('/\b(an chan|an bot|lua dao|da cap|tham nhung|trom|gian lan)\b/u', $t)) {
-        $flags['scam'] = true;
-        $reasons[] = 'Từ khoá cáo buộc/lừa đảo: ăn chặn/đa cấp…';
-    }
-    if (
-        preg_match('/\b(ngu|do ec|do dot|mat day|vo hoc|doi tieu|do ban|tieng chui)\b/u', $t) ||
-        preg_match('/\b(do|thang)\s+(cho|dien|ranh|khung)\b/u', $t)
-    ) {
+    // xúc phạm
+    $bad = '(dm|dmm|dit me|djt|clm|bò|cc|clgt|oc cho|oc lon|lon|ngu lon|mat day|vo hoc|do oc|do dot|do dan|ham|thang|con cho|do ban|do khung|ngu|do ec)';
+    if (preg_match_all('/\b' . $bad . '\b/u', $t, $m)) {
         $flags['harassment'] = true;
-        $reasons[] = 'Lời lẽ xúc phạm/công kích cá nhân.';
+        $ev['harassment'] = array_values(array_unique($m[0]));
+        $cnt = count($m[0]);
+        $heur += min(45, 22 + ($cnt - 1) * 9);
+        $reasons[] = "Ngôn từ xúc phạm ($cnt lần).";
     }
-    if (preg_match('/\b(kiem tien nhanh|0 von|thu nhap khung|viec nhe|việc nhẹ|luong cao|chuyen khoan truoc)\b/u', $t)) {
+    if (preg_match('/\b(thay|co)\s+ham\b/u', $t, $m2)) {
+        $flags['harassment'] = true;
+        $heur += 10;
+        $ev['harassment'][] = 'thay ham';
+        $reasons[] = 'Công kích giáo viên.';
+    }
+
+    // --- Bribery / "phong bì" ---
+    $reBrNorm = '/(?:^|[^a-z0-9])(phong\s*bi|lot\s*tay|di\s*tien|chay\s*tien|hoi\s*lo)(?=$|[^a-z0-9])/i';
+    $reBrUtf  = '/\b(phong\s*bì|lót\s*tay|đi\s*tiền|chạy\s*tiền|hối\s*lộ|ăn\s*chặn)\b/iu';
+    if (_has_kw($t, $text, $reBrNorm, $reBrUtf)) {
+        $flags['bribery'] = true;
+        $flags['scam'] = true;
+        $heur += 25;
+        $ev['bribery'] = _collect_ev($t, $text, $reBrNorm, $reBrUtf);
+        $reasons[] = 'Dấu hiệu hối lộ/“phong bì”.';
+    }
+
+    // --- Sexual / “mại dâm”, clip nóng ---
+    $reSexNorm = '/(?:^|[^a-z0-9])(mai\s*dam|gai\s*goi|clip\s*nong|video\s*nong|xxx|sex|18\+|jav|phim\s*sex|link\s*nong|nhay\s*cam)(?=$|[^a-z0-9])/i';
+    $reSexUtf  = '/\b(mại\s*dâm|gái\s*gọi|clip\s*nóng|video\s*nóng|xxx|sex|18\+|jav|phim\s*sex|link\s*nóng|nhạy\s*cảm)\b/iu';
+    if (_has_kw($t, $text, $reSexNorm, $reSexUtf)) {
+        $flags['sexual'] = true;
+        $flags['scam'] = true;
+        $heur += 35;
+        $ev['sexual'] = _collect_ev($t, $text, $reSexNorm, $reSexUtf);
+        $reasons[] = 'Nội dung tình dục/“mại dâm”.';
+    }
+
+    // mời chào kiếm tiền
+    if (preg_match('/\b(kiem tien nhanh|0 von|thu nhap khung|viec nhe|luong cao|chi can dien thoai|da cap)\b/u', $t)) {
+        $flags['scam'] = true;
+        $heur += 25;
+        $reasons[] = 'Mời chào kiếm tiền/đa cấp.';
+    }
+    if (preg_match('/\b(tien thuong|chuyen khoan truoc|coc|hoa hong)\b/u', $t)) {
         $flags['money_lure'] = true;
-        $reasons[] = 'Mồi chào kiếm tiền không thực tế.';
+        $heur += 10;
     }
-    if (preg_match('/https?:\/\/\S+/i', $text) || preg_match('/\b(m\.me|zalo\.me|t\.me|telegram\.me)\b/i', $text)) {
+
+    // link + miền rủi ro
+    if (preg_match_all('/https?:\/\/\S+/i', $text, $m)) {
         $flags['link'] = true;
-        $reasons[] = 'Có đường link mời gọi/ngoài nền tảng.';
+        $heur += 6;
+        $ev['link'] = $m[0];
+        $reasons[] = 'Có liên kết ngoài.';
     }
-    if (preg_match('/\b0\d{9,10}\b/', $t)) {
+    if (preg_match('/(bit\.ly|t\.me|telegram|zalo\.me|wa\.me|m\.me)/i', $text)) {
+        $heur += 9;
+        $reasons[] = 'Tên miền rủi ro cao.';
+    }
+
+    // SĐT
+    if (preg_match_all('/\b0\d{9,10}\b/', $t, $m)) {
         $flags['phone'] = true;
-        $reasons[] = 'Có số điện thoại liên hệ.';
+        $heur += 4;
+        $ev['phone'] = $m[0];
     }
 
-    // điểm cộng thô
-    $boost = 0;
-    if ($flags['harassment']) $boost += 35;
-    if ($flags['scam'])       $boost += 40;
-    if ($flags['money_lure']) $boost += 15;
-    if ($flags['link'])       $boost += 5;
-    if ($flags['phone'])      $boost += 5;
+    // biểu cảm
+    $exclam = substr_count($text, '!');
+    if ($exclam >= 3) $heur += 6;
+    elseif ($exclam >= 1) $heur += 2;
+    $letters = preg_replace('/[^A-Za-zÀ-ỹĂÂÊÔƠƯĐ]/u', '', $text);
+    $uppers  = preg_replace('/[^A-ZĐÊÔƠƯ]/u', '', $text);
+    $ratio = (mb_strlen($letters, 'UTF-8') ?: 1);
+    $ratio = mb_strlen($uppers, 'UTF-8') / $ratio;
+    if ($ratio > 0.6) $heur += 8;
+    elseif ($ratio > 0.3) $heur += 4;
 
-    return ['flags' => $flags, 'reasons' => $reasons, 'boost' => $boost];
+    return ['flags' => $flags, 'evidence' => $ev, 'reasons' => $reasons, 'heur_score' => $heur];
+}
+
+
+function _dedupe_warnings(array $list): array
+{
+    $seen = [];
+    $out = [];
+    foreach ($list as $w) {
+        $title = mb_strtolower(trim($w['title'] ?? ''));
+        $ev    = mb_strtolower(preg_replace('/\s+/', ' ', trim($w['evidence'] ?? '')));
+        $key   = $title . '|' . $ev;
+        if (isset($seen[$key])) continue;
+        $seen[$key] = 1;
+        $out[] = $w;
+    }
+    return $out;
 }
 
 // Hợp nhất kết quả LLM + luật, tính lại risk
 function _apply_prescreen_and_normalize(array $parsed, array $screen): array
 {
-    // ép bật các cờ nếu luật bắt được
+    // Ánh xạ nhãn theo cờ luật
     if ($screen['flags']['harassment']) $parsed['labels']['hate_speech'] = true;
-    if ($screen['flags']['scam'] || $screen['flags']['money_lure']) $parsed['labels']['scam_phishing'] = true;
+    if ($screen['flags']['scam'] || $screen['flags']['money_lure'] || $screen['flags']['sexual'])
+        $parsed['labels']['scam_phishing'] = true;
 
-    // thêm warnings từ luật
-    foreach ($screen['reasons'] as $r) {
-        $parsed['warnings'][] = [
-            'title' => 'Dấu hiệu rủi ro qua luật',
-            'severity' => ($screen['flags']['scam'] || $screen['flags']['harassment']) ? 'high' : 'medium',
-            'evidence' => $r,
-            'suggestion' => 'Kiểm chứng nguồn; tránh lan truyền; cảnh giác trước lời mời chào/đường link.'
+    // Chuẩn hoá trước
+    $norm = _normalize_analysis($parsed);
+
+    // >>> CHỈ DÙNG CẢNH BÁO TỪ LUẬT <<<
+    $w = [];
+    if ($screen['flags']['harassment']) {
+        $ev = $screen['evidence']['harassment'] ?? [];
+        $w[] = [
+            'title' => 'Ngôn từ xúc phạm/công kích',
+            'severity' => 'high',
+            'evidence' => $ev ? ('Từ ngữ: ' . implode(', ', array_slice($ev, 0, 5))) : 'Từ ngữ xúc phạm',
+            'suggestion' => 'Giữ văn minh, tránh công kích cá nhân.'
         ];
     }
-    if ($screen['flags']['link'])   $parsed['flagged_terms'][] = 'link';
-    if ($screen['flags']['phone'])  $parsed['flagged_terms'][] = 'số_điện_thoại';
+    if ($screen['flags']['bribery']) {
+        $ev = $screen['evidence']['bribery'] ?? [];
+        $w[] = [
+            'title' => 'Cáo buộc phong bì/hối lộ',
+            'severity' => 'high',
+            'evidence' => $ev ? ('Từ khoá: ' . implode(', ', array_slice($ev, 0, 5))) : '“phong bì/lót tay/đi tiền”',
+            'suggestion' => 'Không cáo buộc khi thiếu chứng cứ; nếu có nguồn, hãy dẫn link chính thống.'
+        ];
+    }
+    if ($screen['flags']['sexual']) {
+        $ev = $screen['evidence']['sexual'] ?? [];
+        $w[] = [
+            'title' => 'Rủ rê nội dung nhạy cảm',
+            'severity' => 'high',
+            'evidence' => $ev ? ('Từ khoá: ' . implode(', ', array_slice($ev, 0, 5))) : 'mại dâm/clip nóng…',
+            'suggestion' => 'Tránh phát tán; cảnh giác link/nhóm lạ.'
+        ];
+    }
+    if ($screen['flags']['link']) {
+        $ev = $screen['evidence']['link'] ?? [];
+        $w[] = [
+            'title' => 'Liên kết ngoài/miền rủi ro',
+            'severity' => 'medium',
+            'evidence' => $ev ? ('Link: ' . implode(', ', array_slice($ev, 0, 3))) : 'Có liên kết ngoài',
+            'suggestion' => 'Không bấm link lạ; kiểm tra tên miền; báo cáo nếu nghi ngờ.'
+        ];
+    }
+    if ($screen['flags']['phone']) {
+        $ev = $screen['evidence']['phone'] ?? [];
+        $w[] = [
+            'title' => 'Số liên hệ công khai',
+            'severity' => 'low',
+            'evidence' => $ev ? ('Số: ' . implode(', ', $ev)) : 'Có số điện thoại',
+            'suggestion' => 'Tránh chia sẻ thông tin cá nhân trong bình luận.'
+        ];
+    }
+    // Ghi đè hoàn toàn warnings từ model
+    $norm['warnings'] = $w;
 
-    // Chuẩn hoá kiểu/trường & ước tính lại điểm
-    $norm = _normalize_analysis($parsed);
-    // cộng thêm boost thô
-    $norm['overall_risk'] = min(100, $norm['overall_risk'] + $screen['boost']);
-    // an toàn chia sẻ theo ngưỡng
-    $norm['safe_to_share'] = ($norm['overall_risk'] <= 40);
+    // TÍNH LẠI RISK (giữ công thức tổng hợp bạn đang dùng)
+    $norm['_model_score'] = (isset($parsed['overall_risk']) && is_numeric($parsed['overall_risk'])) ? (int)$parsed['overall_risk'] : 0;
+    $norm['overall_risk']  = _compute_composite_risk($norm, $screen, $parsed);
+
+    // >>> MỨC SÀN THEO CỜ LUẬT <<<
+    if (!empty($screen['flags']['sexual']))   $norm['overall_risk'] = max($norm['overall_risk'], 75);
+    if (!empty($screen['flags']['bribery']))  $norm['overall_risk'] = max($norm['overall_risk'], 65);
+    if (!empty($screen['flags']['harassment'])) $norm['overall_risk'] = max($norm['overall_risk'], 45);
+
+    // Quyết định chia sẻ
+    $shareTh = (int) envv('SAFE_SHARE_THRESHOLD', 45);
+    $norm['safe_to_share'] = $norm['overall_risk'] <= $shareTh;
     return $norm;
 }
+
+
 
 // Tách JSON nếu model trả kèm chữ/code fence
 function _json_from_text_loose(?string $s): ?array
@@ -279,7 +412,7 @@ function _normalize_analysis(array $x): array
         $risk += $out['labels']['hate_speech']     ? 35 : 0;
         $risk += $out['labels']['violence_threat'] ? 50 : 0;
         $risk += min(5, count($out['warnings'])) * 5;
-        $out['overall_risk'] = max(5, min(100, $risk));
+        $out['overall_risk'] = max(0, min(100, $risk));
     }
 
     // Nếu thiếu safe_to_share, suy ra theo ngưỡng
@@ -290,18 +423,114 @@ function _normalize_analysis(array $x): array
     return $out;
 }
 
+function _compute_composite_risk(array $norm, array $screen, ?array $origParsed): int
+{
+    // Trọng số có thể chỉnh qua .env
+    $wModel  = (float) envv('RISK_WEIGHT_MODEL', 0.2);
+    $wLabels = (float) envv('RISK_WEIGHT_LABELS', 0.5);
+    $wHeur   = (float) envv('RISK_WEIGHT_HEUR', 0.3);
+    $sum = max(1e-6, $wModel + $wLabels + $wHeur);
+    $wModel /= $sum;
+    $wLabels /= $sum;
+    $wHeur /= $sum;
+
+    $modelScore = (isset($origParsed['overall_risk']) && is_numeric($origParsed['overall_risk']))
+        ? (int)$origParsed['overall_risk'] : 0;
+
+    $L = $norm['labels'] ?? [];
+    $labelScore  = 0;
+    $labelScore += !empty($L['misinformation'])   ? 25 : 0;
+    $labelScore += !empty($L['propaganda']) && count($L['propaganda']) ? 10 : 0;
+    $labelScore += !empty($L['scam_phishing'])     ? 50 : 0; // ↑
+    $labelScore += !empty($L['hate_speech'])       ? 40 : 0; // ↑
+    $labelScore += !empty($L['violence_threat'])   ? 70 : 0; // ↑
+
+    foreach (($norm['warnings'] ?? []) as $w) {
+        $sev = $w['severity'] ?? 'low';
+        $labelScore += ($sev === 'critical' ? 15 : ($sev === 'high' ? 10 : ($sev === 'medium' ? 6 : 3)));
+    }
+    $labelScore = min(100, $labelScore);
+
+    $heurScore = (int) round(min(100, max(0, (float)($screen['heur_score'] ?? 0))));
+
+    $score = $wModel * $modelScore + $wLabels * $labelScore + $wHeur * $heurScore;
+    return (int) max(0, min(100, round($score)));
+}
+
+
 function analyze_text_with_schema($text)
 {
     $model = envv('OPENAI_MODEL', 'llama-3.1-8b-instant');
     $pres  = _pre_screen_text($text); // ← quét luật trước
 
-    $jsonSchema = [ /* schema của bạn – đã có additionalProperties:false & required đầy đủ */];
+    // Nếu đã có dấu hiệu mạnh -> trả kết quả theo luật (ổn định, không gọi model)
+    if ($pres['flags']['bribery'] || $pres['flags']['sexual'] || $pres['flags']['harassment']) {
+        $parsed = [
+            'overall_risk'  => null,
+            'labels'        => [
+                'misinformation'  => false,
+                'propaganda'      => [],
+                'scam_phishing'   => ($pres['flags']['bribery'] || $pres['flags']['sexual']),
+                'hate_speech'     => $pres['flags']['harassment'],
+                'violence_threat' => false,
+            ],
+            'flagged_terms' => [],
+            'warnings'      => [],   // sẽ được xây lại bằng luật ở _apply_prescreen_and_normalize
+            'safe_to_share' => null,
+            'notes'         => 'rule_only'
+        ];
+        $norm = _apply_prescreen_and_normalize($parsed, $pres);
 
+        // nâng sàn tuyệt đối lần nữa cho chắc
+        if ($pres['flags']['sexual'])    $norm['overall_risk'] = max($norm['overall_risk'], 80);
+        if ($pres['flags']['bribery'])   $norm['overall_risk'] = max($norm['overall_risk'], 70);
+        if ($pres['flags']['harassment']) $norm['overall_risk'] = max($norm['overall_risk'], 50);
+
+        return $norm;
+    }
+
+    $jsonSchema = [
+        'type' => 'object',
+        'additionalProperties' => false,
+        'properties' => [
+            'overall_risk' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 100],
+            'labels' => [
+                'type' => 'object',
+                'additionalProperties' => false,
+                'properties' => [
+                    'misinformation'  => ['type' => 'boolean'],
+                    'propaganda'      => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'scam_phishing'   => ['type' => 'boolean'],
+                    'hate_speech'     => ['type' => 'boolean'],
+                    'violence_threat' => ['type' => 'boolean'],
+                ],
+                'required' => ['misinformation', 'propaganda', 'scam_phishing', 'hate_speech', 'violence_threat']
+            ],
+            'flagged_terms' => ['type' => 'array', 'items' => ['type' => 'string']],
+            'warnings' => [
+                'type' => 'array',
+                'items' => [
+                    'type' => 'object',
+                    'additionalProperties' => false,
+                    'properties' => [
+                        'title'      => ['type' => 'string'],
+                        'severity'   => ['type' => 'string', 'enum' => ['low', 'medium', 'high', 'critical']],
+                        'evidence'   => ['type' => 'string'],
+                        'suggestion' => ['type' => 'string'],
+                    ],
+                    'required' => ['title', 'severity', 'evidence', 'suggestion']
+                ]
+            ],
+            'safe_to_share' => ['type' => 'boolean'],
+            'notes'         => ['type' => 'string'],
+        ],
+        'required' => ['overall_risk', 'labels', 'flagged_terms', 'warnings', 'safe_to_share', 'notes']
+    ];
     $prompt =
-        "Bạn là hệ thống kiểm tra an toàn thông tin & định hướng đúng trên MXH.\n" .
-        "Dấu hiệu tiền xử lý (heuristic) phát hiện được: " . json_encode($pres['flags']) . ".\n" .
-        "Khi các dấu hiệu trên xuất hiện, hãy cân nhắc bật nhãn phù hợp và nêu bằng chứng cụ thể.\n" .
-        "Phân tích dựa trên bằng chứng; nếu thiếu, ghi 'không đủ dữ liệu'.\n";
+        "Bạn là hệ thống kiểm tra rủi ro nội dung MXH.\n" .
+        "Chỉ đánh giá theo các nhóm: tin giả/thiếu nguồn, mời chào/lừa đảo, xúc phạm/công kích, kích động bạo lực, nội dung nhạy cảm, liên kết rủi ro, thông tin cá nhân.\n" .
+        "Không suy đoán về chính trị, tội phạm, cơ quan nhà nước… nếu văn bản KHÔNG nêu rõ. Không thêm cảnh báo không có bằng chứng trong văn bản.\n" .
+        "Trả JSON đúng schema, không thêm chữ khác.\n";
 
     // 1) Structured Outputs
     try {
@@ -318,6 +547,9 @@ function analyze_text_with_schema($text)
                     'schema' => $jsonSchema
                 ]
             ],
+            'temperature' => 0,
+            'top_p' => 1,
+            'store' => false,
         ]);
         $out = _extract_text_from_response($resp);
         $parsed = $out ? _json_from_text_loose($out) : null;
@@ -340,6 +572,9 @@ function analyze_text_with_schema($text)
             ['role' => 'user', 'content' => $text],
         ],
         'text' => ['format' => ['type' => 'text']],
+        'temperature' => 0,
+        'top_p' => 1,
+        'store' => false,
     ]);
     $out2 = _extract_text_from_response($resp2);
     $parsed2 = $out2 ? _json_from_text_loose($out2) : null;

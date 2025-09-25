@@ -1,41 +1,51 @@
 <?php
 require_once __DIR__ . '/../../lib/config.php';
-require_once __DIR__ . '/../../lib/db.php';
 require_once __DIR__ . '/../../lib/auth.php';
+require_once __DIR__ . '/../../lib/db.php';
 require_once __DIR__ . '/../../lib/fb_graph.php';
+
 send_security_headers();
 require_admin();
 
-$minRisk = (int)($_GET['min_risk'] ?? envv('AUTO_RISK_THRESHOLD', 60));
-$window  = (int)($_GET['window'] ?? 1440); // phút (mặc định 24h)
-$limit   = (int)($_GET['limit'] ?? 100);
+$pdo = db();
 
-$sinceSql = date('Y-m-d H:i:s', time() - $window * 60);
+$minRisk = max(0, (int)($_GET['min_risk'] ?? 60));
+$window  = (isset($_GET['window']) ? (int)$_GET['window'] : 1440); // phút; 0 = bỏ lọc thời gian
+$limit   = max(1, (int)($_GET['limit']  ?? 100));
 
-// Lấy các hành động auto (trong khung thời gian) có risk >= ngưỡng
-$st = db()->prepare("
-  SELECT object_id, MAX(risk) AS risk,
-         SUM(action='replied')>0 AS replied,
-         SUM(action='hidden')>0  AS hidden,
-         MAX(created_at) AS last_time
+$params = [];
+$where  = "object_type='comment'
+           AND action IN ('score','scored_comment','replied','hidden')
+           AND risk >= ?";
+
+$params[] = $minRisk;
+
+if ($window > 0) {
+    $since = date('Y-m-d H:i:s', time() - $window * 60);
+    $where .= " AND created_at >= ?";
+    $params[] = $since;
+}
+
+$sql = "
+  SELECT object_id,
+         MAX(risk)       AS risk,
+         MAX(created_at) AS last_seen
   FROM auto_actions
-  WHERE object_type='comment' AND created_at >= ? AND risk >= ?
+  WHERE $where
   GROUP BY object_id
-  ORDER BY last_time DESC
-  LIMIT {$limit}
-");
-$st->execute([$sinceSql, $minRisk]);
-$rows = $st->fetchAll(PDO::FETCH_ASSOC);
+  ORDER BY risk DESC, last_seen DESC
+  LIMIT $limit
+";
+$stmt = $pdo->prepare($sql);
+$stmt->execute($params);
+$rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Lấy chi tiết comment từ Graph
-$items = [];
-foreach ($rows as $r) {
-    try {
-        $c = fb_get_comment($r['object_id']);
-        $items[] = ['meta' => $r, 'c' => $c];
-    } catch (Exception $e) {
-        $items[] = ['meta' => $r, 'c' => ['id' => $r['object_id'], 'message' => '(Không lấy được từ Graph)', 'permalink_url' => '#']];
-    }
+function risk_level($r)
+{
+    if ($r >= 80) return ['critical', 'Nguy cấp'];
+    if ($r >= 60) return ['high', 'Cao'];
+    if ($r >= 40) return ['medium', 'Trung bình'];
+    return ['low', 'Thấp'];
 }
 ?>
 <!doctype html>
@@ -47,279 +57,266 @@ foreach ($rows as $r) {
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="/assets/styles.css">
     <style>
-        body {
-            font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
-            margin: 0;
-            background: #ffffffff;
-            color: while
+        /* ====== Bổ sung style nhẹ cho trang này ====== */
+        .page {
+            max-width: 1100px;
+            margin: 32px auto;
+            padding: 0 16px;
         }
 
-        header {
+        .breadcrumb {
             display: flex;
-            justify-content: space-between;
+            gap: 8px;
             align-items: center;
-            padding: 16px 24px;
-            background: #9ca2d9ff;
-            border-bottom: 1px solid #20274a
+            color: #9aa4b2;
+            font-size: 14px;
         }
 
-        h1 {
-            font-size: 20px;
-            margin: 0
+        .h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin: 8px 0 16px;
         }
 
-        nav a {
-            color: #9cc1ff;
-            text-decoration: none
-        }
-
-        main {
-            max-width: 900px;
-            margin: 24px auto;
-            padding: 0 16px
-        }
-
-        form textarea {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 12px;
-            border-radius: 12px;
-            border: 1px solid #2c3566;
-            background: white;
-            color: black;
-        }
-
-        button {
-            margin-top: 12px;
-            padding: 10px 16px;
-            border-radius: 12px;
-            border: 0;
-            background: #3759ff;
-            color: #fff;
-            cursor: pointer
-        }
-
-        .checkbox {
-            display: block;
-            margin-top: 8px;
-            color: #a5b4fc
-        }
-
-        #result {
-            margin-top: 24px
-        }
-
-        .warning {
-            border: 1px solid #374151;
-            border-left: 6px solid #64748b;
-            border-radius: 10px;
-            padding: 12px;
-            margin: 10px 0;
-            background: #fefefeff
-        }
-
-        .warning.high {
-            border-left-color: #f59e0b
-        }
-
-        .warning.critical {
-            border-left-color: #ef4444
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 999px;
-            background: #1f2a5a;
-            color: #9cc1ff;
-            margin-right: 6px
-        }
-
-        #risk {
-            font-weight: 600;
-            margin-bottom: 8px
-        }
-    </style>
-    <style>
-        .toolbar {
+        .filters {
             display: flex;
+            flex-wrap: wrap;
             gap: 12px;
-            align-items: center;
-            margin: 16px 0;
+            align-items: flex-end;
+            border: 1px solid #1f2a44;
+            padding: 14px;
+            border-radius: 14px;
+            margin: 12px 0 22px;
         }
 
-        .risk-high {
-            background: #f44336;
-            color: #fff;
+        .filters label {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            font-size: 13px;
+            color: #94a3b8;
         }
 
-        .risk-med {
-            background: #ff9800;
-            color: #000;
+        .filters input[type=number] {
+            width: 140px;
+            padding: 10px 12px;
+            border: 1px solid #22314f;
+            background: #0b1220;
+            color: #e5e7eb;
+            border-radius: 10px;
+            outline: none;
         }
 
-        .risk-low {
-            background: #8bc34a;
-            color: #000;
+        .btn {
+            padding: 10px 14px;
+            border-radius: 10px;
+            border: 1px solid #22314f;
+            background: #0b1220;
+            color: #e5e7eb;
+            cursor: pointer;
+        }
+
+        .btn:hover {
+            background: #111a2f;
+        }
+
+        .btn-primary {
+            background: linear-gradient(90deg, #2d6bfe, #5e4bfa);
+            border: none;
+        }
+
+        .btn-primary[disabled] {
+            opacity: .7;
+            cursor: not-allowed;
+        }
+
+        .cards {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
         }
 
         .card {
-            background: #0f1320;
-            border: 1px solid #223;
-            border-radius: 12px;
-            padding: 12px;
-            margin: 12px 0;
+            border: 1px solid #1f2a44;
+            background: #0b1220;
+            border-radius: 16px;
+            padding: 14px;
         }
 
-        .row {
+        .card__top {
             display: flex;
-            gap: 12px;
             justify-content: space-between;
+            gap: 10px;
             align-items: center;
         }
 
-        .msg {
-            white-space: pre-wrap;
-            margin: 8px 0;
-            color: #dfe6ff;
+        .meta {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            color: #9aa4b2;
+            font-size: 14px;
         }
 
-        .muted {
-            opacity: .7
+        .badge {
+            font-size: 12px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-weight: 600;
+        }
+
+        .badge.low {
+            background: #16361f;
+            color: #7ee787;
+        }
+
+        .badge.medium {
+            background: #382f1a;
+            color: #ffd277;
+        }
+
+        .badge.high {
+            background: #3a1d20;
+            color: #ff9ca5;
+        }
+
+        .badge.critical {
+            background: #3b1114;
+            color: #ff5c6e;
+        }
+
+        .msg {
+            color: #e5e7eb;
+            white-space: pre-wrap;
+            margin-top: 8px;
         }
 
         .actions {
             display: flex;
-            gap: 8px;
-            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
         }
 
-        .actions input[type=text] {
-            width: 360px;
-            max-width: 60vw;
+        .btn-link {
+            background: #0f172a;
+            border: 1px solid #24324f;
         }
 
         .small {
             font-size: 12px;
+            color: #94a3b8;
+        }
+
+        .kbd {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            background: #111827;
+            border: 1px solid #374151;
+            padding: 2px 6px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #cbd5e1;
+        }
+
+        .empty {
+            text-align: center;
+            color: #94a3b8;
+            padding: 32px 8px;
+            border: 1px dashed #24324f;
+            border-radius: 14px;
+            background: #0b1220;
         }
     </style>
+    <meta name="csrf-token" content="<?= htmlspecialchars(csrf_token()) ?>">
+    <script src="/assets/moderation.js" defer></script>
 </head>
 
 <body>
     <header style="display:flex;gap:12px;align-items:center;justify-content:space-between;padding:16px 24px;background:#0f1530;border-bottom:1px solid #20274a">
-        <div><strong style="color: red;">Admin • Comment cảnh báo cao</strong></div>
+        <div><strong style="color: red;">Cảnh báo cao</strong></div>
         <nav>
-            <a class="badge" href="/admin/dashboard.php">Bảng điều khiển</a> ·
-            <a class="badge" href="/admin/moderation.php"><b style="color: yellow;">Cảnh báo cao</b></a> ·
-            <a class="badge" href="/logout.php">Đăng xuất</a>
+            <a class="badge" href="/admin/dashboard.php">Bảng điều khiển</a>
+            <a class="badge" href="/admin/logout.php">Đăng xuất</a>
         </nav>
     </header>
-    <main>
-        <div class="row">
-            <form class="toolbar" method="get" style="width: 100%;">
-                <label>Ngưỡng rủi ro
-                    <input type="number" name="min_risk" value="<?= htmlspecialchars($minRisk) ?>" min="0" max="100" style="width:72px; border: 1px solid;border-radius: 5px;">
-                </label>
-                <label>Trong vòng (phút)
-                    <input type="number" name="window" value="<?= htmlspecialchars($window) ?>" min="5" style="width:88px; border: 1px solid;border-radius: 5px;">
-                </label>
-                <label>Giới hạn
-                    <input type="number" name="limit" value="<?= htmlspecialchars($limit) ?>" min="10" style="width:88px; border: 1px solid;border-radius: 5px;">
-                </label>
-                <button type="submit">Lọc</button>
 
-                <form id="scanNowForm" method="post" action="/admin/action.php" style="margin-left:auto">
-                    <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
-                    <input type="hidden" name="action" value="scan_now">
-                    <input type="hidden" name="window" value="30">
-                    <button type="submit">🔄 Quét ngay (30 phút gần nhất)</button>
-                </form>
-            </form>
+    <main class="page">
+        <div class="breadcrumb">
+            <span>Admin</span> › <span>Cảnh báo cao</span>
         </div>
+        <div class="h1">Comment có cảnh báo cao</div>
 
-        <?php if (!$items): ?>
-            <p class="muted text-center">Không có comment nào vượt ngưỡng trong khung thời gian đã chọn.</p>
-        <?php endif; ?>
+        <form class="filters" method="get" id="filterForm">
+            <label>Ngưỡng rủi ro
+                <input type="number" name="min_risk" min="0" max="100" value="<?= htmlspecialchars($minRisk) ?>">
+            </label>
+            <label>Trong vòng (phút) — (0 để bỏ lọc thời gian)
+                <input type="number" name="window" min="0" value="<?= htmlspecialchars($window) ?>">
+            </label>
+            <label>Giới hạn
+                <input type="number" name="limit" min="1" max="500" value="<?= htmlspecialchars($limit) ?>">
+            </label>
 
-        <?php foreach ($items as $it):
-            $c    = $it['c'];
-            $meta = $it['meta'];
-            $risk = (int)$meta['risk'];
-            $riskClass = $risk >= 80 ? 'risk-high' : ($risk >= 60 ? 'risk-med' : 'risk-low');
-            $replyText = "[BQT] Vui lòng trao đổi văn minh, cung cấp nguồn xác thực. Xin cảm ơn!";
-        ?>
-            <div class="card">
-                <div class="row">
-                    <div>
-                        <a href="<?= htmlspecialchars($c['permalink_url'] ?? '#') ?>" target="_blank">Mở Facebook</a>
-                        <div class="small muted">ID: <?= htmlspecialchars($c['id']) ?> • Lần quét: <?= htmlspecialchars($meta['last_time']) ?></div>
-                    </div>
-                    <div class="badge <?= $riskClass ?>">Rủi ro: <?= $risk ?>/100</div>
-                </div>
+            <button class="btn" type="submit">Lọc</button>
 
-                <div class="small muted" style="margin-top:6px">
-                    Tác giả: <?= htmlspecialchars($c['from']['name'] ?? 'N/A') ?> •
-                    Lúc: <?= htmlspecialchars($c['created_time'] ?? '') ?> •
-                    Trạng thái: <?= !empty($meta['hidden']) ? 'ĐÃ ẨN' : (($c['is_hidden'] ?? false) ? 'ĐÃ ẨN' : 'ĐANG HIỂN THỊ') ?> •
-                    Đã trả lời: <?= $meta['replied'] ? 'Có' : 'Chưa' ?>
-                </div>
+            <button class="btn btn-primary" id="scanBtn" type="button" title="Quét comment gần đây và chấm điểm tự động">
+                <span id="scanText">Quét ngay (30 phút gần nhất)</span>
+            </button>
+            <button id="scanPostsBtn" class="btn btn-primary">
+                Quét bài viết (60 phút gần nhất)
+            </button>
+            <span id="scanPostsText" class="muted"></span>
+        </form>
 
-                <div class="msg"><?= htmlspecialchars($c['message'] ?? '(trống)') ?></div>
-
-                <div class="actions">
-                    <form method="post" action="/admin/action.php" onsubmit="return doReply(event)">
-                        <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
-                        <input type="hidden" name="action" value="comment">
-                        <input type="hidden" name="id" value="<?= htmlspecialchars($c['id']) ?>">
-                        <input type="text" name="message" placeholder="Phản hồi cảnh báo..." value="<?= htmlspecialchars($replyText) ?>">
-                        <button type="submit">Trả lời</button>
-                    </form>
-
-                    <form method="post" action="/admin/action.php" onsubmit="return doHide(event, true)">
-                        <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
-                        <input type="hidden" name="action" value="hide_comment">
-                        <input type="hidden" name="id" value="<?= htmlspecialchars($c['id']) ?>">
-                        <input type="hidden" name="hide" value="1">
-                        <button type="submit">Ẩn</button>
-                    </form>
-
-                    <form method="post" action="/admin/action.php" onsubmit="return doHide(event, false)">
-                        <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token()) ?>">
-                        <input type="hidden" name="action" value="hide_comment">
-                        <input type="hidden" name="id" value="<?= htmlspecialchars($c['id']) ?>">
-                        <input type="hidden" name="hide" value="0">
-                        <button type="submit">Hiện</button>
-                    </form>
+        <?php if (!$rows): ?>
+            <div class="empty">
+                Không có comment nào vượt ngưỡng trong khung thời gian đã chọn.
+                <div class="small" style="margin-top:6px">
+                    Gợi ý: hạ ngưỡng rủi ro, tăng “Trong vòng (phút)” lên <b>1440</b> (1 ngày) hoặc bấm “Quét ngay”.
                 </div>
             </div>
-        <?php endforeach; ?>
+        <?php else: ?>
+            <div class="cards">
+                <?php foreach ($rows as $r):
+                    $cid = $r['object_id'];
+                    try {
+                        $c = fb_api("/$cid", ['fields' => 'id,from{name,id},message,permalink_url,created_time']);
+                    } catch (Exception $e) {
+                        $c = ['id' => $cid, 'from' => ['name' => 'N/A'], 'message' => '(Không lấy được nội dung từ Graph)', 'permalink_url' => '#', 'created_time' => $r['last_seen']];
+                    }
+                    $risk = (int)$r['risk'];
+                    [$lvlClass, $lvlText] = risk_level($risk);
+                ?>
+                    <article class="card" data-id="<?= htmlspecialchars($cid) ?>">
+                        <div class="card__top">
+                            <div class="meta">
+                                <span class="badge <?= $lvlClass ?>">Rủi ro: <?= $risk ?>/100 · <?= $lvlText ?></span>
+                                <span class="small">Cập nhật: <?= htmlspecialchars($r['last_seen']) ?></span>
+                            </div>
+                            <?php if (!empty($c['permalink_url'])): ?>
+                                <a class="btn btn-link" target="_blank" href="<?= htmlspecialchars($c['permalink_url']) ?>">Mở Facebook</a>
+                            <?php endif; ?>
+                        </div>
+
+                        <div class="meta" style="margin-top:6px">
+                            <strong><?= htmlspecialchars($c['from']['name'] ?? 'N/A') ?></strong>
+                            <span class="small">• <?= htmlspecialchars($c['created_time'] ?? '') ?></span>
+                        </div>
+
+                        <div class="msg" data-collapsed="1" style="max-height:4.5em; overflow:hidden;">
+                            <?= htmlspecialchars($c['message'] ?? '') ?>
+                        </div>
+
+                        <div class="actions">
+                            <button class="btn" type="button" data-reply>Trả lời</button>
+                            <button class="btn" type="button" data-hide>Ẩn</button>
+                            <button class="btn" type="button" data-unhide>Hiện</button>
+                        </div>
+                    </article>
+                <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
     </main>
 
-    <script>
-        async function doReply(e) {
-            e.preventDefault();
-            const res = await fetch(e.target.action, {
-                method: 'POST',
-                body: new FormData(e.target)
-            });
-            const data = await res.json();
-            if (data.error) alert('Lỗi: ' + data.error);
-            else alert('Đã trả lời!');
-            return false;
-        }
-        async function doHide(e, hide) {
-            e.preventDefault();
-            const fd = new FormData(e.target);
-            const res = await fetch(e.target.action, {
-                method: 'POST',
-                body: fd
-            });
-            const data = await res.json();
-            if (data.error) alert('Lỗi: ' + data.error);
-            else alert(hide ? 'Đã ẩn' : 'Đã hiện');
-            return false;
-        }
-    </script>
 </body>
 
 </html>

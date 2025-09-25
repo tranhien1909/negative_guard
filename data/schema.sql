@@ -55,3 +55,18 @@ CREATE TABLE IF NOT EXISTS auto_actions (
 ALTER TABLE auto_actions
   ADD INDEX idx_created (created_at),
   ADD INDEX idx_risk (risk);
+
+  -- bảng chuẩn cho MySQL/MariaDB
+CREATE TABLE IF NOT EXISTS auto_actions (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  object_id    VARCHAR(64) NOT NULL,
+  object_type  ENUM('post','comment') NOT NULL,
+  action       VARCHAR(32) NOT NULL,
+  risk         INT DEFAULT 0,
+  reason       VARCHAR(255),
+  response_text TEXT,
+  created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_object_action (object_id, action),
+  KEY idx_created_at (created_at),
+  KEY idx_object_type (object_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

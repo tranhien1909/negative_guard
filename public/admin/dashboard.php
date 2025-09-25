@@ -167,8 +167,6 @@ try {
                                     <input type="hidden" name="id" value="<?= htmlspecialchars($c['id']) ?>">
                                     <textarea name="message" placeholder="Phản hồi cảnh báo..." style="width:100%; margin-top: 10px;"></textarea>
                                     <button class="badge" type="submit">Trả lời</button>
-                                    <button class="badge" type="button" onclick="toggleHide('<?= htmlspecialchars($c['id']) ?>', true)">Ẩn</button>
-                                    <button class="badge" type="button" onclick="toggleHide('<?= htmlspecialchars($c['id']) ?>', false)">Hiện</button>
                                 </form>
                                 <div id="res-<?= htmlspecialchars($c['id']) ?>" class="warning" style="display:none"></div>
                             </div>
@@ -177,10 +175,10 @@ try {
                 </details>
 
 
-                <form method="post" action="#" onsubmit="return analyzePost(event, '<?= htmlspecialchars($p['id']) ?>', `<?= htmlspecialchars($p['message'] ?? '', ENT_QUOTES) ?>`)" style="margin-top:10px">
-                    <button type="submit">Phân tích bài viết</button>
-                </form>
-                <div id="res-<?= htmlspecialchars($p['id']) ?>" class="warning" style="display:none"></div>
+                <!-- <button class="analyze-post-btn" data-post-id="<?= htmlspecialchars($p['id']) ?>">
+                    Phân tích bài viết
+                </button> -->
+                <div id="ana-<?= htmlspecialchars($p['id']) ?>" class="analysis-box"></div>
             </article>
         <?php endforeach; ?>
     </main>
@@ -267,6 +265,62 @@ try {
             return false;
         }
     </script>
+    <script>
+        async function renderAnalysis(container, data) {
+            const html = [];
+            if (data.post) {
+                html.push(`<div class="card">
+      <div><b>Post</b> — rủi ro: ${data.post.risk}/100
+        · <a target="_blank" href="${data.post.permalink_url||'#'}">Mở Facebook</a></div>
+    </div>`);
+            }
+            if (data.comments?.length) {
+                data.comments.sort((a, b) => b.risk - a.risk);
+                for (const c of data.comments) {
+                    html.push(`<div class="card">
+        <div><b>${c.from||'N/A'}</b> — rủi ro: ${c.risk}/100</div>
+        <div style="white-space:pre-wrap">${(c.message||'').replace(/[<>&]/g,m=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[m]))}</div>
+        <div class="muted">${c.created_time||''}</div>
+      </div>`);
+                }
+            } else {
+                html.push('<div class="muted">Không có bình luận để phân tích.</div>');
+            }
+            container.innerHTML = html.join('');
+        }
+
+        document.querySelectorAll('.analyze-post-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const id = btn.dataset.postId;
+                const box = document.getElementById('ana-' + id);
+                btn.disabled = true;
+                const old = btn.textContent;
+                btn.textContent = 'Đang phân tích...';
+                try {
+                    const fd = new FormData();
+                    fd.append('csrf', '<?= htmlspecialchars(csrf_token()) ?>');
+                    fd.append('action', 'analyze_post');
+                    fd.append('id', id);
+                    const res = await fetch('/admin/action.php', {
+                        method: 'POST',
+                        body: fd
+                    });
+                    const data = await res.json();
+                    if (data.error) {
+                        box.textContent = 'Lỗi: ' + data.error;
+                    } else {
+                        await renderAnalysis(box, data);
+                    }
+                } catch (e) {
+                    box.textContent = 'Lỗi kết nối: ' + e.message;
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = old;
+                }
+            });
+        });
+    </script>
+
 </body>
 
 </html>
